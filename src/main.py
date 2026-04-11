@@ -31,6 +31,7 @@ from src.logging_config import LoggingManager
 from src.incremental_sync import NSE_HOLIDAYS
 from src.signal_storage import SignalStorage
 from src.signal_exporter import SignalExcelExporter
+from src.excel_export_manager import ExcelExportManager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -113,8 +114,9 @@ class StockAutomationTool:
         # Initialize signal storage and exporter
         self.signal_storage = SignalStorage(storage_dir=self.local_storage_dir)
         self.signal_exporter = SignalExcelExporter(storage_dir=self.local_storage_dir)
+        self.excel_export_manager = ExcelExportManager(storage_dir=self.local_storage_dir)
         self.logging_panel.add_log("[bold green]✓ Signal storage initialized[/bold green]")
-        logger.info("✓ Signal storage and Excel exporter initialized")
+        logger.info("✓ Signal storage, Excel exporter, and Advanced Export Manager initialized")
         
         # Load and validate API keys from environment
         self._validate_api_keys()
@@ -413,6 +415,33 @@ class StockAutomationTool:
         
         logger.info(f"Generated {len(signals)} sample signals for {target_date}")
         return signals
+    
+    def export_advanced_timeseries_workbook(self, date_str: str = None) -> str:
+        """
+        Export an advanced multi-sheet workbook with time-series data and sophisticated formatting.
+        
+        Args:
+            date_str: Date string for filename (optional)
+            
+        Returns:
+            str: Path to created Excel file
+        """
+        try:
+            # Generate sample dataframes
+            dataframes = self.excel_export_manager.generate_sample_dataframes()
+            
+            # Create advanced workbook
+            filepath = self.excel_export_manager.create_advanced_workbook(
+                dataframes=dataframes,
+                date_str=date_str
+            )
+            
+            self.logging_panel.add_log(f"[bold green]✓ Advanced workbook created[/bold green]")
+            logger.info(f"✓ Advanced multi-sheet workbook exported: {filepath}")
+            return filepath
+        except Exception as e:
+            logger.error(f"Failed to export advanced workbook: {e}")
+            return ""
     
     def _get_next_candle_close_time(self, timeframe_minutes: int = 5) -> dict:
         """
