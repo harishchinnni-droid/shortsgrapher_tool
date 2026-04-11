@@ -85,3 +85,18 @@ config/local_config.yml
 data/
 output/
 logs/
+local_trading_data/
+
+# CRITICAL: Sensitive Files - NEVER commit these to version control
+.env
+.env.local
+.env.*.local
+credentials.json
+*.key
+*.pem
+session_cache.json
+*.csv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
