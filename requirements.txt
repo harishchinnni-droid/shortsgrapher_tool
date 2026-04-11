@@ -1,0 +1,11 @@
+PyYAML>=5.4
+kiteconnect>=4.0
+smartapi-python>=1.3
+pyotp>=2.8
+selenium>=4.0
+webdriver-manager>=3.8
+logzero>=1.7
+sqlalchemy>=1.4
+pandas>=1.3
+numpy>=1.21
+pyodbc>=4.0

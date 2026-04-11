@@ -1,0 +1,23 @@
+# Stock Automation Tool Configuration
+
+# Application settings
+app:
+  name: "Stock Automation Tool"
+  version: "1.0.0"
+  debug: false
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/app.log"
+
+# Database configuration (if needed)
+database:
+  type: "sqlite"  # sqlite, mysql, postgresql
+  connection_string: "data/stock.db"
+
+# API configuration (if needed)
+api:
+  timeout: 30
+  retry_attempts: 3
