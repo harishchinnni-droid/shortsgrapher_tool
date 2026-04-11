@@ -97,6 +97,12 @@ credentials.json
 session_cache.json
 *.csv
 
+# Excel files - Report exports (NEVER commit)
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb

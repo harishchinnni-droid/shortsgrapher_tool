@@ -29,6 +29,8 @@ from rich import box
 
 from src.logging_config import LoggingManager
 from src.incremental_sync import NSE_HOLIDAYS
+from src.signal_storage import SignalStorage
+from src.signal_exporter import SignalExcelExporter
 
 # Load environment variables from .env file
 load_dotenv()
@@ -107,6 +109,12 @@ class StockAutomationTool:
             logger.info(f"Created local storage directory: {self.local_storage_dir}")
         
         logger.info(f"Local storage directory: {self.local_storage_dir}")
+        
+        # Initialize signal storage and exporter
+        self.signal_storage = SignalStorage(storage_dir=self.local_storage_dir)
+        self.signal_exporter = SignalExcelExporter(storage_dir=self.local_storage_dir)
+        self.logging_panel.add_log("[bold green]✓ Signal storage initialized[/bold green]")
+        logger.info("✓ Signal storage and Excel exporter initialized")
         
         # Load and validate API keys from environment
         self._validate_api_keys()
@@ -370,6 +378,42 @@ class StockAutomationTool:
         
         logger.info(f"✓ Setup indicator audit directories for {len(indicators)} indicators")
     
+    def _generate_sample_signals(self, target_date: date) -> list:
+        """
+        Generate sample trading signals for demonstration.
+        
+        Args:
+            target_date: Date for which to generate signals
+            
+        Returns:
+            List of signal dictionaries
+        """
+        symbols = ["RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFC", "LT", "WIPRO", "BAJAJFINSV"]
+        signal_types = ["buy", "sell", "strong_buy", "strong_sell"]
+        
+        signals = []
+        for i, symbol in enumerate(symbols):
+            signal = {
+                "signal_date": target_date.strftime("%Y-%m-%d"),
+                "symbol": symbol,
+                "signal_type": signal_types[i % len(signal_types)],
+                "signal_strength": round(50 + (i * 5), 2),
+                "rsi_value": round(30 + (i * 8), 2),
+                "vwap_value": round(1000 + (i * 50), 2),
+                "adx_value": round(20 + (i * 3), 2),
+                "squeeze_momentum": round(0.5 + (i * 0.1), 2),
+                "ema_value": round(950 + (i * 50), 2),
+                "oi_dynamics": round(100000 + (i * 10000), 2),
+                "breakout_score": round(45 + (i * 5), 2),
+                "entry_price": round(1000 + (i * 50), 2),
+                "stop_loss": round(980 + (i * 50), 2),
+                "take_profit": round(1100 + (i * 50), 2)
+            }
+            signals.append(signal)
+        
+        logger.info(f"Generated {len(signals)} sample signals for {target_date}")
+        return signals
+    
     def _get_next_candle_close_time(self, timeframe_minutes: int = 5) -> dict:
         """
         Calculate the exact time when the next candle will close.
@@ -615,9 +659,30 @@ class StockAutomationTool:
             ) as progress:
                 progress.add_task("[blue]Evaluating trading signals...[/blue]", total=None)
                 time.sleep(1)  # Simulate evaluation
+                
+                # Create sample signals for demonstration
+                sample_signals = self._generate_sample_signals(target_date)
+                for signal in sample_signals:
+                    self.signal_storage.insert_signal(signal)
             
-            self.logging_panel.add_log("[bold green]✓ Signals evaluated[/bold green]")
-            logger.info("✓ Signal evaluation complete")
+            self.logging_panel.add_log("[bold green]✓ Signals evaluated & stored in database[/bold green]")
+            logger.info("✓ Signal evaluation complete & stored in signals.db")
+            
+            # Export signals to Excel
+            console.print("\n[bold cyan]EXPORTING SIGNALS TO EXCEL[/bold cyan]")
+            signals = self.signal_storage.get_signals_by_date(target_date.strftime("%Y-%m-%d"))
+            if signals:
+                excel_path = self.signal_exporter.export_signals(signals, target_date.strftime("%Y-%m-%d"))
+                console.print(Panel(
+                    Align.center(
+                        f"[bold green]✓ Signals Exported to Excel[/bold green]\n"
+                        f"[green]File:[/green] {excel_path}"
+                    ),
+                    style="green",
+                    expand=True
+                ))
+                self.logging_panel.add_log(f"[bold green]✓ Excel exported: {excel_path}[/bold green]")
+                logger.info(f"✓ Signals exported to Excel: {excel_path}")
             
             console.print(Panel(
                 Align.center("[bold green]✓ Backtest Complete[/bold green]"),
@@ -760,6 +825,24 @@ class StockAutomationTool:
                 console.print("[bold green]✓ Order execution check complete[/bold green]")
                 self.logging_panel.add_log("[bold green]✓ Orders checked[/bold green]")
                 logger.info("✓ Order execution check complete")
+                
+                # Step 6: Export signals to Excel
+                console.print("\n[bold cyan]STEP 6: SIGNAL EXPORT[/bold cyan]")
+                logger.info("[STEP 6] Exporting signals to Excel...")
+                self.logging_panel.add_log("[bold cyan]Step 6: Excel export[/bold cyan]")
+                
+                # Create sample signals for this cycle
+                sample_signals = self._generate_sample_signals(date.today())
+                for signal in sample_signals:
+                    self.signal_storage.insert_signal(signal)
+                
+                # Export to Excel
+                signals = self.signal_storage.get_signals_by_date(date.today().strftime("%Y-%m-%d"))
+                if signals:
+                    excel_path = self.signal_exporter.export_signals(signals)
+                    console.print(f"[bold green]✓ Signals exported to:[/bold green] {excel_path}")
+                    self.logging_panel.add_log(f"[bold green]✓ Excel: {excel_path}[/bold green]")
+                    logger.info(f"✓ Signals exported to Excel: {excel_path}")
                 
                 # Summary
                 console.print(Panel(
