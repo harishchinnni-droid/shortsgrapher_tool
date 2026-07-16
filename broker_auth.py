@@ -112,7 +112,27 @@ def initialize_zerodha():
     options.add_experimental_option('excludeSwitches', ['enable-automation'])
     options.add_experimental_option('useAutomationExtension', False)
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    # [ADDED -- Colab/cloud portability] Desktop Windows already has Chrome
+    # installed, so ChromeDriverManager().install() (which only fetches a
+    # matching CHROMEDRIVER, never the browser itself) plus Selenium's own
+    # auto-detection of the installed Chrome binary has always been enough
+    # here. A bare Colab VM has neither Chrome nor Chromium installed by
+    # default -- webdriver.Chrome() fails with "cannot find Chrome binary"
+    # there regardless of the driver, because there's no browser for the
+    # driver to launch. Rather than hardcode a Colab-specific path into
+    # this file (which would assume one specific apt package layout and
+    # could silently break if Colab's base image changes), both pieces are
+    # optional env var overrides that do nothing unless explicitly set --
+    # see the Colab notebook's setup cell, which installs chromium via apt
+    # and sets these two after confirming the actual installed paths.
+    chrome_binary = os.environ.get("CHROME_BINARY_LOCATION")
+    if chrome_binary:
+        options.binary_location = chrome_binary
+
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    service = Service(chromedriver_path) if chromedriver_path else Service(ChromeDriverManager().install())
+
+    driver = webdriver.Chrome(service=service, options=options)
     try:
         driver.get(f"https://kite.trade/connect/login?v=3&api_key={creds['api_key']}")
         wait = WebDriverWait(driver, 20)
