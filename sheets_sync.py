@@ -55,20 +55,26 @@ the phone/browser view is stale until the next successful sync.
 import os
 import file_mgmt
 
-# [FLAG] Stays False (no-op, no gspread import even attempted) until the
-# one-time setup above is complete. Can also be flipped via env var
-# without touching this file, e.g. for a quick on/off toggle from Colab:
-#   os.environ["ENABLE_SHEETS_SYNC"] = "1"
-ENABLE_SHEETS_SYNC = os.environ.get("ENABLE_SHEETS_SYNC", "0") == "1"
+# [FLAG] One-time setup (see docstring) is done -- service account JSON
+# is in 01_JSON_Files, and 01_SourceFile has been shared with it as
+# Editor (see TARGET_SHEET_ID below: this reuses that existing sheet
+# rather than a separate dedicated one -- new 'Orders'/'Dashboard' tabs
+# get added alongside 'Reference'/'Copy of Reference 2' without touching
+# them, since sync_to_google_sheets() only ever writes to sheet names in
+# SHEETS_TO_MIRROR). Can still be overridden off via env var if needed:
+#   os.environ["ENABLE_SHEETS_SYNC"] = "0"
+ENABLE_SHEETS_SYNC = os.environ.get("ENABLE_SHEETS_SYNC", "1") == "1"
 
 JSON_DIR = os.path.join(file_mgmt.BASE_DIR, "01_JSON_Files")
 SERVICE_ACCOUNT_FILE = os.path.join(JSON_DIR, "google_service_account.json")
 
-# Set this to the target spreadsheet's ID once created/shared -- see
-# module docstring step 7. Left blank on purpose: sync_to_google_sheets()
-# raises a clear, actionable error (caught by every call site) rather
-# than silently pointing at nothing.
-TARGET_SHEET_ID = os.environ.get("SHEETS_SYNC_TARGET_ID", "")
+# [SET] Harish's existing 01_SourceFile Google Sheet -- reused as the
+# viewer mirror target rather than a separate dedicated sheet (deliberate
+# choice, see sheets_sync.py conversation notes). Override via env var
+# without editing this file if the target ever needs to change.
+TARGET_SHEET_ID = os.environ.get(
+    "SHEETS_SYNC_TARGET_ID", "1ObfXwDkTZTCkiJIVzYDP1NAl1n19TLqgucZp-mOGIdY"
+)
 
 SHEETS_TO_MIRROR = ("Orders", "Dashboard")
 
