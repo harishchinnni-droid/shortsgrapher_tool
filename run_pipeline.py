@@ -169,13 +169,33 @@ def run_pipeline_for_date(smart_api, kite_api, target_date, mode):
     # five indicators, which is where the actual wall-clock win comes from.
     workers_per_indicator = max(1, cpu_count // num_indicators)
 
-    print(f"[PROCESS] Launching {num_indicators} indicator engines in parallel "
-          f"({workers_per_indicator} worker process(es) each, {cpu_count} logical CPUs detected)...")
+    # [ADDED -- Colab/low-core portability] The line above already caps
+    # each indicator's OWN process pool, but nothing capped how many of
+    # those pools got created AT ONCE -- the ThreadPoolExecutor below used
+    # to always launch all num_indicators (9) simultaneously regardless of
+    # cpu_count, so a 9-vs-1-worker split just meant 9 separate
+    # ProcessPoolExecutor pools (9 OS processes) all fighting over
+    # however many logical CPUs actually exist. Harmless oversubscription
+    # on a desktop with plenty of cores; on a 2-vCPU Colab VM (also a tiny
+    # /dev/shm, which multiprocessing's own semaphores rely on -- the same
+    # constraint that broke headless Chrome earlier) this caused one
+    # indicator with genuinely trivial work (Breakout Probability's
+    # single-day per-symbol loop) to sit starved for CPU time for
+    # several minutes instead of milliseconds. Capping concurrent
+    # indicator-level threads to cpu_count means only that many process
+    # pools ever exist at once; the rest queue in the ThreadPoolExecutor
+    # and start as soon as a slot frees, so Colab still gets real
+    # (just narrower) parallelism instead of 9-way contention on 2 cores.
+    max_concurrent_indicators = min(num_indicators, max(1, cpu_count))
+
+    print(f"[PROCESS] Launching {num_indicators} indicator engines "
+          f"({max_concurrent_indicators} running at a time, "
+          f"{workers_per_indicator} worker process(es) each, {cpu_count} logical CPUs detected)...")
 
     matrix_results = {}   # label -> matrix_rows
     failures = {}          # label -> exception
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_indicators) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_indicators) as executor:
         # [FIX] Every module's build_matrix() was updated (13-Jul-26 pass) to
         # require target_date as its 2nd positional arg -- see
         # excel_utils.restrict_to_target_date(). This call site was never
