@@ -1,0 +1,12 @@
+pandas
+numpy
+openpyxl
+pytz
+requests
+kiteconnect
+smartapi-python
+pyotp
+selenium
+webdriver-manager
+logzero
+websocket-client
