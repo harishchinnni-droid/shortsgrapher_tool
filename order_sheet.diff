@@ -1,0 +1,204 @@
+--- /mnt/project/order_sheet.py	1979-12-31 00:00:00.000000000 +0000
++++ order_sheet.py	2026-07-13 13:11:42.717702309 +0000
+@@ -143,6 +143,10 @@
+ # LIVE cycles for the same reason the OI cache does -- see
+ # PCRTrendTracker below.
+ PCR_TREND_CACHE = os.path.join(JSON_DIR, "pcr_trend_cache.json")      # LIVE mode only
++# [ADDED -- risk_and_signal_patches audit] Daily drawdown guard state,
++# LIVE mode only -- same persistence pattern as PCR_TREND_CACHE, for the
++# same reason (build_order_sheet() is re-instantiated once per cycle).
++DAILY_DRAWDOWN_CACHE = os.path.join(JSON_DIR, "daily_drawdown_cache.json")
+ 
+ VIX_MAX = 18.0
+ MIN_ENTRY_LTP = 6.0
+@@ -158,6 +162,22 @@
+ PCR_TREND_BAND_PE = 1.15
+ PCR_TREND_MIN_READINGS = 3
+ 
++# [ADDED -- risk_and_signal_patches audit, 13-Jul-26] The 06-13 Jul 26
++# sample showed 65% of executed trades (32/49) carried PCR Trend =
++# INSUFFICIENT_DATA, and that bucket alone accounted for 93% of total
++# losses (-Rs 11,231 of -Rs 12,026) at a 31.2% win rate. Root cause:
++# pcr_tracker.record() only fires when a NEW 3-bar signal streak starts
++# for a symbol -- most symbols never see 3 separate streak events before
++# their entry fires. This flag makes recording ALSO fire on any single-
++# bar BUY CE/PE reading (not requiring all 3 bars to agree), which
++# happens far more often, so 3 readings accrue earlier in a symbol's
++# session. Trade-off: more PCR lookups per symbol per day -- cheap in
++# BACKTEST (reads cached historical data), a real rate-limit cost in
++# LIVE. Consider disabling in LIVE if Kite rate limits become an issue;
++# the persistence fix (PCR_TREND_CACHE, already applied) still helps on
++# its own across cycles even with this off.
++ENABLE_EAGER_PCR_RECORDING = True
++
+ ORDER_HEADERS = [
+     'Symbol', 'PCR', 'PCR Trend', 'OI Signal',
+     'Pre-Entry Trigger Time', 'Pre-Entry Trigger Status',
+@@ -497,7 +517,22 @@
+     else:
+         quadrant = "LONG_UNWINDING"
+ 
+-    confirms = quadrant in ("LONG_BUILDUP", "SHORT_COVERING") if signal in ("BUY CE", "BUY PE") else True
++    # [FIX -- risk_and_signal_patches audit] see historical_lookup.
++    # get_historical_oi_buildup()'s matching fix for the full rationale
++    # and backtest evidence; kept identical here for LIVE/BACKTEST
++    # consistency. ALLOW_SHORT_COVERING_CONFIRM lives on historical_lookup
++    # (imported below) so both code paths share one toggle.
++    bullish_quadrants = {"LONG_BUILDUP"}
++    if historical_lookup.ALLOW_SHORT_COVERING_CONFIRM:
++        bullish_quadrants.add("SHORT_COVERING")
++    bearish_quadrants = {"SHORT_BUILDUP", "LONG_UNWINDING"}
++
++    if signal == "BUY CE":
++        confirms = quadrant in bullish_quadrants
++    elif signal == "BUY PE":
++        confirms = quadrant in bearish_quadrants
++    else:
++        confirms = True
+     return quadrant, confirms
+ 
+ 
+@@ -524,6 +559,22 @@
+     pcr_tracker = PCRTrendTracker(cache_path=None if is_backtest else PCR_TREND_CACHE)
+     hist_cache = historical_lookup.HistoricalCache(kite_api) if is_backtest else None
+ 
++    # [ADDED -- risk_and_signal_patches audit] Daily drawdown circuit
++    # breaker. LIVE: persists across cycles via DAILY_DRAWDOWN_CACHE, so
++    # .breached() genuinely blocks new entries mid-session once crossed
++    # -- same pattern as pcr_tracker above. BACKTEST: Net P/L doesn't
++    # exist yet during this loop (Phase 1 decides entries before Phase 2
++    # resolves any exit), so .breached() will never trip here regardless
++    # of how the day resolves -- see DailyDrawdownGuard's docstring in
++    # position_manager.py. The Phase 2.5 block after Phase 2 reports what
++    # the guard WOULD have done, retroactively, without pretending it
++    # blocked anything it didn't.
++    dd_guard = position_manager.DailyDrawdownGuard(
++        max_daily_loss_rs=position_manager.DAILY_MAX_LOSS_RS,
++        cache_path=None if is_backtest else position_manager.DAILY_DRAWDOWN_CACHE,
++        date_key=None if is_backtest else target_date.strftime('%Y-%m-%d') if target_date else None,
++    )
++
+     # BACKTEST: start from a clean slate every run -- previously this
+     # always read the existing Orders/Rejected sheets and merged onto
+     # them, which is correct for LIVE (resuming an intraday session) but
+@@ -610,6 +661,34 @@
+             s2 = time_map.get(t2, "WAIT")
+             s3 = time_map.get(t3, "WAIT")
+ 
++            # [ADDED -- risk_and_signal_patches audit] Eager PCR recording,
++            # see ENABLE_EAGER_PCR_RECORDING docstring above. Fires on any
++            # single-bar BUY CE/PE reading, independent of whether a full
++            # 3-bar streak has formed, so pcr_tracker accrues its
++            # PCR_TREND_MIN_READINGS readings earlier in the session
++            # instead of only when a streak happens to complete. Wrapped
++            # defensively -- a failure here must never abort entry
++            # detection for this candle.
++            if ENABLE_EAGER_PCR_RECORDING and s1 in ("BUY CE", "BUY PE"):
++                try:
++                    eager_base_match = _match_symbol(df_ref, sym)
++                    if eager_base_match is not None:
++                        if is_backtest:
++                            eager_spot = historical_lookup.get_spot_snapshot(sym, target_date, t1) or 0
++                        else:
++                            eager_quote = kite_api.quote([f"NSE:{sym}"])
++                            eager_spot = eager_quote.get(f"NSE:{sym}", {}).get('last_price', 0)
++                        if eager_spot:
++                            if is_backtest:
++                                eager_pcr = historical_lookup.get_historical_pcr(
++                                    sym, eager_spot, target_date, t1, df_ref, kite_master, kite_api, hist_cache
++                                )
++                            else:
++                                eager_pcr = calculate_local_pcr(sym, eager_spot, df_ref, kite_master, kite_api)
++                            pcr_tracker.record(sym, eager_pcr)
++                except Exception as e:
++                    print(f"[WARNING] Eager PCR recording failed for {sym} at {t1}: {e}")
++
+             if current_signal_streak is None:
+                 if not (s1 == s2 == s3 and s1 in ("BUY CE", "BUY PE")):
+                     continue
+@@ -625,6 +704,21 @@
+                         current_signal_streak = None
+                         continue
+ 
++                    # [ADDED -- risk_and_signal_patches audit] Daily
++                    # drawdown circuit breaker. In LIVE mode (cache_path
++                    # set) this genuinely blocks new entries once crossed.
++                    # In BACKTEST mode this will never trip here -- see
++                    # DailyDrawdownGuard's docstring -- it's still checked
++                    # for LIVE/BACKTEST code-path symmetry and to make the
++                    # limitation visible rather than silent.
++                    if dd_guard.breached():
++                        reason = (f"{sym}: Daily drawdown cap breached (realized Rs "
++                                  f"{dd_guard.status()['realized_pl']:.2f}). No new entries for the rest of the session.")
++                        print(f"[REJECTED] {sym} -> {reason}")
++                        _log_rejection(sym, t1, s1, reason)
++                        current_signal_streak = None
++                        continue
++
+                     base_match = _match_symbol(df_ref, sym)
+                     spot_price = 0
+                     if base_match is not None:
+@@ -868,6 +962,36 @@
+                 'Exit Time': result['exit_time'], 'Exit Reason': result['exit_reason'],
+             })
+ 
++    # --- Phase 2.5, BACKTEST only: POST-HOC daily drawdown replay. ---
++    # [ADDED -- risk_and_signal_patches audit] Net P/L only exists after
++    # Phase 2 above, by which point every entry for the day was already
++    # taken in Phase 1 -- so dd_guard.breached() was never True during
++    # entry decisions this run (see DailyDrawdownGuard's docstring). This
++    # block answers a different, still-useful question after the fact:
++    # "walking through today's trades in the order they were ENTERED, at
++    # what point would the daily cap have been crossed, and how much of
++    # the day's loss came from trades opened after that point?" It's a
++    # diagnostic on top of the backtest, not a claim that any trade below
++    # was actually prevented.
++    if is_backtest:
++        entered_orders = [o for o in existing_orders.values() if str(o.get('Net P/L (Rs)', "")).strip() not in ("", "nan")]
++        entered_orders.sort(key=lambda o: str(o.get('Pre-Entry Trigger Time', "")))
++        replay_guard = position_manager.DailyDrawdownGuard(max_daily_loss_rs=position_manager.DAILY_MAX_LOSS_RS)
++        pl_after_breach = 0.0
++        trades_after_breach = 0
++        for o in entered_orders:
++            net_pl = float(o.get('Net P/L (Rs)') or 0)
++            was_breached_before = replay_guard.breached()
++            replay_guard.update(net_pl, at_time_str=o.get('Pre-Entry Trigger Time'))
++            if was_breached_before:
++                pl_after_breach += net_pl
++                trades_after_breach += 1
++        if replay_guard.breached():
++            print(f"[RISK] Post-hoc replay: a Rs {position_manager.DAILY_MAX_LOSS_RS:.0f} daily cap would have "
++                  f"triggered at {replay_guard.status()['breach_time']} this session. {trades_after_breach} "
++                  f"trade(s) were entered after that point, contributing Rs {pl_after_breach:.2f} to the day's "
++                  f"total -- these would NOT have been taken live with the guard active.")
++
+     df_orders_out = pd.DataFrame(list(existing_orders.values()), columns=ORDER_HEADERS)
+     df_rejected_out = pd.DataFrame(rejected_rows, columns=REJECTED_HEADERS)
+     return df_orders_out, df_rejected_out
+@@ -940,6 +1064,18 @@
+     if 'Orders' not in sheet_names:
+         return  # expected pre-first-order-sheet-run state -- not an error
+ 
++    # [ADDED -- risk_and_signal_patches audit] Same persisted guard as
++    # build_order_sheet() -- LIVE mode's sequential, real-time polling is
++    # exactly where this circuit breaker is designed to work: closing a
++    # position here that crosses the daily cap will cause the NEXT call
++    # to build_order_sheet() (which re-reads DAILY_DRAWDOWN_CACHE) to
++    # reject all new entries for the rest of the session.
++    dd_guard = position_manager.DailyDrawdownGuard(
++        max_daily_loss_rs=position_manager.DAILY_MAX_LOSS_RS,
++        cache_path=position_manager.DAILY_DRAWDOWN_CACHE,
++        date_key=today_ist().strftime('%Y-%m-%d'),
++    )
++
+     try:
+         df_orders = pd.read_excel(output_excel_path, sheet_name='Orders')
+     except Exception as e:
+@@ -1004,6 +1140,7 @@
+             df_orders.at[idx, 'Costs (Rs)'] = costs['total']
+             df_orders.at[idx, 'Net P/L (Rs)'] = net_pl
+             print(f"[EXECUTION] {order.get('Symbol')} closed live: {exit_reason}, Net P/L Rs.{net_pl:.2f}")
++            dd_guard.update(net_pl, at_time_str=now.strftime('%H:%M:%S'))
+ 
+     if changed:
+         with pd.ExcelWriter(output_excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:

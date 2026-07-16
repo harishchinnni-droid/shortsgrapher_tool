@@ -1,0 +1,252 @@
+--- /mnt/project/position_manager.py	1979-12-31 00:00:00.000000000 +0000
++++ position_manager.py	2026-07-13 13:11:42.718430641 +0000
+@@ -56,6 +56,7 @@
+ """
+ 
+ import math
++import os
+ from datetime import datetime, timedelta
+ 
+ import pandas as pd
+@@ -124,6 +125,39 @@
+ # Max Drawdown against the baseline before trusting it live.
+ ENABLE_SIGNAL_REVERSAL_EXIT = False
+ 
++# [ADDED -- risk_and_signal_patches audit, 13-Jul-26] The Rs 2,000 hard
++# cap above solves for the exit price at which GROSS loss == max_loss_rs,
++# then round-trip costs are subtracted AFTER -- so every trade that hits
++# it realizes a NET loss bigger than the stated cap. All 3 occurrences in
++# the 06-13 Jul 26 sample breached it: -Rs 2,195.80 / 2,234.12 / 2,174.93
++# against a Rs 2,000 ceiling (9-12% overshoot every time). Set False to
++# restore the original cost-blind cap for an A/B re-run.
++ENABLE_COST_AWARE_STOP_CAP = True
++
++# [ADDED -- same audit] "Max Hold Time (75min)" was the single largest
++# loss bucket by trade count in the sample (22/49 = 45% of trades, 27.3%
++# win rate, -Rs 6,312 net) and "EOD Square-off" the second largest
++# (10/49, 20% win, -Rs 2,757) -- combined, 75% of total losses came from
++# trades that were simply held until time ran out. Meanwhile every trade
++# that reached "Trailing Stop Hit" or "Target Hit" was profitable (9/9,
++# 100%). This is a PROPOSED rule, not yet evidence-backed the way the
++# cost-aware cap above is -- test it in isolation (same dates, only this
++# flag changed) before trusting it. Set False to disable entirely.
++ENABLE_NO_FOLLOWTHROUGH_EXIT = True
++NO_FOLLOWTHROUGH_MINUTES = 20        # give the trade this long to show real movement
++NO_FOLLOWTHROUGH_R_MULTIPLE = 0.5    # "real movement" = reached +0.5R favorable excursion
++
++# [ADDED -- same audit] No daily loss circuit breaker existed anywhere in
++# the pipeline (confirmed by grep across this file, order_sheet.py, and
++# 01_Master_Code.py) despite capital preservation being the stated
++# priority. -Rs 5,068.36 was the single worst day in the 8-day sample
++# (07-Jul-26) on the Rs 5,00,000 default account below -- this default
++# caps daily loss at roughly 2x that, tune to your own risk tolerance.
++# See DailyDrawdownGuard below -- BACKTEST-mode limitation documented on
++# the class itself, read it before assuming this blocks entries the same
++# way in both modes.
++DAILY_MAX_LOSS_RS = 10_000.0
++
+ # ---------------------------------------------------------------------------
+ # Cost model
+ # ---------------------------------------------------------------------------
+@@ -179,6 +213,42 @@
+     }
+ 
+ 
++def solve_cost_aware_cap_exit(entry_ltp, quantity, max_loss_rs, floor_price=0.05, iterations=2):
++    """[ADDED] Returns cap_exit_ltp such that NET loss (gross + estimated
++    round-trip cost AT that exit price) lands at/near max_loss_rs, instead
++    of the old formula which only capped GROSS loss and let costs push the
++    realized loss past the stated ceiling. Costs are a small, near-linear
++    function of turnover, so 2 fixed-point iterations converges tightly --
++    see the smoke test at the bottom of this file."""
++    if quantity <= 0 or entry_ltp <= 0:
++        return max(entry_ltp, floor_price)
++
++    cap_exit_ltp = max(entry_ltp - (max_loss_rs / quantity), floor_price)
++    for _ in range(iterations):
++        est_cost = estimate_round_trip_costs(entry_ltp, cap_exit_ltp, quantity)['total']
++        effective_gross_cap = max(max_loss_rs - est_cost, 0.0)
++        cap_exit_ltp = max(entry_ltp - (effective_gross_cap / quantity), floor_price)
++    return round(cap_exit_ltp, 2)
++
++
++def _no_followthrough_triggered(entry_dt, current_dt, max_ltp_seen, entry_ltp,
++                                 risk_per_unit_premium,
++                                 minutes=NO_FOLLOWTHROUGH_MINUTES,
++                                 r_multiple=NO_FOLLOWTHROUGH_R_MULTIPLE):
++    """[ADDED] True if the trade has neither hit stop/target/trailing NOR
++    shown at least r_multiple x risk_per_unit_premium of favorable
++    excursion within `minutes` of entry -- i.e. it's dead weight, cut it
++    rather than ride it to Max Hold / EOD. See ENABLE_NO_FOLLOWTHROUGH_EXIT
++    docstring above for the evidence this targets."""
++    if risk_per_unit_premium <= 0:
++        return False
++    elapsed_minutes = (current_dt - entry_dt).total_seconds() / 60.0
++    if elapsed_minutes < minutes:
++        return False
++    favorable_excursion = max_ltp_seen - entry_ltp
++    return favorable_excursion < (r_multiple * risk_per_unit_premium)
++
++
+ # ---------------------------------------------------------------------------
+ # ATR-based stop/target + equity-risk position sizing
+ # ---------------------------------------------------------------------------
+@@ -286,7 +356,13 @@
+         if quantity > 0:
+             worst_case_loss = (entry_ltp - candle_low) * quantity
+             if worst_case_loss > max_loss_rs:
+-                cap_exit_ltp = max(entry_ltp - (max_loss_rs / quantity), 0.05)
++                # [CHANGED] cost-aware cap -- see ENABLE_COST_AWARE_STOP_CAP
++                # docstring above for why the old formula overshot its own
++                # stated ceiling by 9-12% every time it fired.
++                if ENABLE_COST_AWARE_STOP_CAP:
++                    cap_exit_ltp = solve_cost_aware_cap_exit(entry_ltp, quantity, max_loss_rs)
++                else:
++                    cap_exit_ltp = max(entry_ltp - (max_loss_rs / quantity), 0.05)
+                 return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(cap_exit_ltp, 2),
+                         'exit_reason': f'Hard Stop-Loss (Rs {max_loss_rs:.0f} cap)',
+                         'max_ltp_seen': round(max_ltp_seen, 2), 'min_ltp_seen': round(min_ltp_seen, 2)}
+@@ -316,6 +392,14 @@
+             return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(candle_close, 2),
+                     'exit_reason': '5M Reversal (Signal WAIT)', 'max_ltp_seen': round(max_ltp_seen, 2),
+                     'min_ltp_seen': round(min_ltp_seen, 2)}
++        # [ADDED] see ENABLE_NO_FOLLOWTHROUGH_EXIT docstring above --
++        # checked after every real price-based exit, before the time-cap
++        # exits it's specifically designed to preempt.
++        if ENABLE_NO_FOLLOWTHROUGH_EXIT and _no_followthrough_triggered(
++                entry_dt, ts, max_ltp_seen, entry_ltp, risk_per_unit_premium):
++            return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(candle_close, 2),
++                    'exit_reason': f'No Follow-Through ({NO_FOLLOWTHROUGH_MINUTES}min, <{NO_FOLLOWTHROUGH_R_MULTIPLE}R)',
++                    'max_ltp_seen': round(max_ltp_seen, 2), 'min_ltp_seen': round(min_ltp_seen, 2)}
+         if ts >= max_hold_dt:
+             return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(candle_close, 2),
+                     'exit_reason': f'Max Hold Time ({max_hold_minutes}min)', 'max_ltp_seen': round(max_ltp_seen, 2),
+@@ -370,8 +454,19 @@
+     # [ADDED] Checked first, same as simulate_backtest_exit() -- a live LTP
+     # print can gap between polls just like a backtest candle can.
+     if quantity > 0:
++        # [CHANGED] cost-aware: in LIVE mode we exit at whatever current_ltp
++        # is (no price to "solve for" like backtest), so instead the
++        # TRIGGER fires a bit earlier -- once unrealized loss crosses
++        # (max_loss_rs - estimated round-trip cost at this price) -- so
++        # that by the time costs are actually deducted downstream, net
++        # loss still lands at/under max_loss_rs. See ENABLE_COST_AWARE_STOP_CAP.
++        if ENABLE_COST_AWARE_STOP_CAP:
++            est_cost = estimate_round_trip_costs(entry_ltp, current_ltp, quantity)['total']
++            effective_cap = max(max_loss_rs - est_cost, 0.0)
++        else:
++            effective_cap = max_loss_rs
+         unrealized_loss = (entry_ltp - current_ltp) * quantity
+-        if unrealized_loss > max_loss_rs:
++        if unrealized_loss > effective_cap:
+             return True, f'Hard Stop-Loss (Rs {max_loss_rs:.0f} cap)', current_ltp, new_max, trailing_stop
+ 
+     if current_ltp <= trailing_stop:
+@@ -381,6 +476,10 @@
+         return True, 'Target Hit', target_ltp, new_max, trailing_stop
+     if ENABLE_SIGNAL_REVERSAL_EXIT and signal_reversal_now:
+         return True, '5M Reversal (Signal WAIT)', current_ltp, new_max, trailing_stop
++    if ENABLE_NO_FOLLOWTHROUGH_EXIT and _no_followthrough_triggered(
++            entry_dt, now_dt, new_max, entry_ltp, risk_per_unit_premium):
++        return (True, f'No Follow-Through ({NO_FOLLOWTHROUGH_MINUTES}min, <{NO_FOLLOWTHROUGH_R_MULTIPLE}R)',
++                current_ltp, new_max, trailing_stop)
+     if now_dt >= entry_dt + timedelta(minutes=max_hold_minutes):
+         return True, f'Max Hold Time ({max_hold_minutes}min)', current_ltp, new_max, trailing_stop
+     if now_dt >= eod_dt:
+@@ -389,6 +488,96 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# Daily max-drawdown circuit breaker. [ADDED -- no equivalent existed
++# anywhere in the pipeline before this patch; grep confirmed it across
++# this file, order_sheet.py, and 01_Master_Code.py.]
++# ---------------------------------------------------------------------------
++class DailyDrawdownGuard:
++    """Tracks realized Net P/L across a session and flips to breached once
++    max_daily_loss_rs is crossed. Call .update(net_pl) every time a
++    position closes; check .breached() before opening any new one.
++
++    IMPORTANT -- mode-dependent behavior, read before wiring in:
++
++    LIVE mode: order_sheet.build_order_sheet() is called once per
++    candle-close cycle (see check_live_exit()'s docstring). Entries and
++    exits both happen in real time across cycles, so a guard that's
++    PERSISTED across cycles (cache_path set, mirroring PCRTrendTracker's
++    fix) genuinely blocks new entries mid-session once the daily cap is
++    breached. This is the mode this class is designed for.
++
++    BACKTEST mode: build_order_sheet() resolves ALL of a day's entries
++    first (Phase 1, the per-symbol streak-detection loop), and only
++    THEN walks forward through each position's own candle history to
++    determine its real exit/P&L (Phase 2, the `if is_backtest:` block
++    after the main loop). Net P/L literally doesn't exist yet at the
++    point where Phase 1 decides whether to take a new trade -- so
++    .breached() will never be True during Phase 1 in backtest mode, no
++    matter how bad the day's resolved P&L turns out to be in Phase 2.
++    This is a structural property of the two-phase backtest design, not
++    a bug in this class. Treat the backtest use of this guard as a
++    POST-HOC reporting tool ("what would the cap have saved us, applied
++    retroactively in entry-time order?"), not a live-equivalent
++    circuit breaker -- see order_sheet.py's Phase 2.5 addition for how
++    this is surfaced without pretending it blocked anything it didn't.
++    """
++
++    def __init__(self, max_daily_loss_rs=DAILY_MAX_LOSS_RS, cache_path=None, date_key=None):
++        self.max_daily_loss_rs = max_daily_loss_rs
++        self.cache_path = cache_path
++        self.date_key = date_key
++        self.realized_pl = 0.0
++        self._breached = False
++        self._breach_time = None
++        if cache_path and date_key:
++            state = _load_json(cache_path, {}).get(date_key)
++            if state:
++                self.realized_pl = state.get('realized_pl', 0.0)
++                self._breached = state.get('breached', False)
++                self._breach_time = state.get('breach_time')
++
++    def _persist(self):
++        if self.cache_path and self.date_key:
++            _save_json(self.cache_path, {self.date_key: self.status()})
++
++    def update(self, net_pl_of_closed_trade, at_time_str=None):
++        self.realized_pl += net_pl_of_closed_trade
++        if not self._breached and self.realized_pl <= -abs(self.max_daily_loss_rs):
++            self._breached = True
++            self._breach_time = at_time_str or datetime.now().strftime('%H:%M:%S')
++            print(f"[RISK] Daily drawdown cap breached at {self._breach_time}: "
++                  f"realized P/L Rs {self.realized_pl:.2f} <= -Rs {self.max_daily_loss_rs:.2f}. "
++                  f"No new entries for the rest of the session.")
++        self._persist()
++
++    def breached(self):
++        return self._breached
++
++    def status(self):
++        return {'realized_pl': round(self.realized_pl, 2), 'max_daily_loss_rs': self.max_daily_loss_rs,
++                'breached': self._breached, 'breach_time': self._breach_time}
++
++
++def _load_json(path, default):
++    import json
++    try:
++        with open(path, 'r') as f:
++            return json.load(f)
++    except Exception:
++        return default
++
++
++def _save_json(path, data):
++    import json
++    try:
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, 'w') as f:
++            json.dump(data, f)
++    except Exception as e:
++        print(f"[WARNING] Failed to persist {path}: {e}")
++
++
++# ---------------------------------------------------------------------------
+ # Disclaimer: nothing in this module places real orders -- it only
+ # computes sizing/exit numbers for order_sheet.py to record. It is not
+ # financial advice, no result here is a guarantee of future performance,

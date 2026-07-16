@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+logs/
+03_Option_Historical_Data/
+F:\05_Claude_Automation\02_Historical_Data/
+*.json
+*.xlsx
