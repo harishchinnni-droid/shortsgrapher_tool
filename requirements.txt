@@ -10,3 +10,5 @@ selenium
 webdriver-manager
 logzero
 websocket-client
+gspread>=6.0.0
+google-auth

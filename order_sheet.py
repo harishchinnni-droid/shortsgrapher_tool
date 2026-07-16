@@ -131,6 +131,7 @@ import historical_lookup
 import position_manager
 import dashboard
 import file_mgmt
+import sheets_sync
 from ist_clock import today_ist
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -1337,6 +1338,17 @@ def run_order_sheet_step(output_excel_path, kite_api, df_ref,
     except Exception as e:
         print(f"[WARNING] Dashboard rebuild failed (non-fatal): {e}")
 
+    # [ADDED -- Phase B, viewer mirror] No-op unless ENABLE_SHEETS_SYNC is
+    # on (see sheets_sync.py docstring for one-time setup). Wrapped here
+    # too, on top of sheets_sync's own internal no-op check, so a genuine
+    # sync failure (bad key, quota, network) can never take down the
+    # actual trading pipeline -- worst case the phone/browser view is
+    # simply stale until the next successful cycle.
+    try:
+        sheets_sync.sync_to_google_sheets(output_excel_path)
+    except Exception as e:
+        print(f"[WARNING] Google Sheets viewer sync failed (non-fatal): {e}")
+
 
 # ---------------------------------------------------------------------------
 # [ADDED] LIVE-mode open-position polling -- call once per candle-close
@@ -1454,6 +1466,13 @@ def update_open_positions_live(kite_api, output_excel_path):
             dashboard.build_dashboard_sheet(output_excel_path, mode=calendar_mgmt.LIVE, target_date=None)
         except Exception as e:
             print(f"[WARNING] Dashboard rebuild failed (non-fatal): {e}")
+
+        # [ADDED -- Phase B, viewer mirror] Same no-op-unless-enabled
+        # mirror as run_order_sheet_step() above -- see sheets_sync.py.
+        try:
+            sheets_sync.sync_to_google_sheets(output_excel_path)
+        except Exception as e:
+            print(f"[WARNING] Google Sheets viewer sync failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------------------
