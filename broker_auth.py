@@ -105,6 +105,14 @@ def initialize_zerodha():
     options.add_argument('--headless=new')
     options.add_argument('--disable-gpu')
     options.add_argument('--no-sandbox')
+    # [ADDED -- Colab/cloud portability] Containers like Colab's VM give
+    # Chrome a tiny /dev/shm by default; Chrome's default shared-memory
+    # usage overflows it and the browser process crashes immediately after
+    # the session starts ("Chrome instance exited") -- not a missing-binary
+    # problem, a resource-limit one. Harmless on desktop Windows (plenty of
+    # shared memory there), so this is safe to always set rather than
+    # gate behind an env var.
+    options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--start-maximized')
     options.add_argument('--window-size=1366,900')
     options.add_argument('--disable-blink-features=AutomationControlled')
