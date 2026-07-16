@@ -98,7 +98,27 @@ def initialize_zerodha():
             cache = json.load(f)
             if cache.get('date') == today_str and cache.get('access_token'):
                 kite.set_access_token(cache['access_token'])
-                return kite
+                # [ADDED] The date match above only proves this cache was
+                # WRITTEN today -- it says nothing about whether Kite's
+                # server still honors the token right now. A token can go
+                # dead mid-day (e.g. logging into Kite's own app/website
+                # elsewhere kills the API session issued here) while this
+                # file still shows today's date, and the cache would keep
+                # getting reused as if it were fine -- every single
+                # downstream call then fails identically with "Incorrect
+                # api_key or access_token", which is exactly what surfaced
+                # across every symbol (both historical_lookup and the
+                # incremental sync workers) in one Colab run even though
+                # login itself had reported success earlier that session.
+                # A cheap kite.profile() call actually exercises the token
+                # against Kite's server before trusting it; on failure,
+                # fall through to a fresh Selenium login instead of
+                # silently handing back a token that's already dead.
+                try:
+                    kite.profile()
+                    return kite
+                except Exception as e:
+                    print(f"[WARNING] Cached Zerodha token failed validation ({e}) -- forcing fresh login.")
 
     print("[SYSTEM] Initiating Automated Selenium Login for Zerodha...")
     options = webdriver.ChromeOptions()
