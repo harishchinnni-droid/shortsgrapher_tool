@@ -5,8 +5,13 @@ import pandas as pd
 from datetime import datetime, timedelta
 from ist_clock import now_ist
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import file_mgmt
 
-HIST_DIR = r"F:\05_Claude_Automation\02_Historical_Data"
+# [CHANGED -- cloud/Colab portability] derives from file_mgmt.BASE_DIR --
+# see file_mgmt.py's BASE_DIR docstring. historical_lookup.OPTION_HIST_DIR
+# is itself derived from this constant (os.path.dirname(HIST_DIR) + join),
+# so fixing it here automatically carries through without a second edit.
+HIST_DIR = os.path.join(file_mgmt.BASE_DIR, "02_Historical_Data")
 os.makedirs(HIST_DIR, exist_ok=True)
 
 

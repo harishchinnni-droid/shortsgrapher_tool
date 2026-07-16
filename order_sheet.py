@@ -130,6 +130,7 @@ import calendar_mgmt
 import historical_lookup
 import position_manager
 import dashboard
+import file_mgmt
 from ist_clock import today_ist
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -137,7 +138,9 @@ IST = pytz.timezone('Asia/Kolkata')
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-JSON_DIR = r"F:\05_Claude_Automation\01_JSON_Files"
+# [CHANGED -- cloud/Colab portability] derives from file_mgmt.BASE_DIR --
+# see file_mgmt.py's BASE_DIR docstring.
+JSON_DIR = os.path.join(file_mgmt.BASE_DIR, "01_JSON_Files")
 OI_SNAPSHOT_CACHE = os.path.join(JSON_DIR, "oi_snapshot_cache.json")   # LIVE mode only, see fix #4 above
 # [ADDED -- 13-Jul-26] PCR trend history now persists to disk across
 # LIVE cycles for the same reason the OI cache does -- see

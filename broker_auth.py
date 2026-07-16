@@ -16,9 +16,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import ElementNotInteractableException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
+import file_mgmt
 
 # Paths
-JSON_DIR = r"F:\05_Claude_Automation\01_JSON_Files"
+# [CHANGED -- cloud/Colab portability] derives from file_mgmt.BASE_DIR
+# (itself ALGO_BASE_DIR-overridable) instead of hardcoding this pipeline's
+# root a second time -- see file_mgmt.py's BASE_DIR docstring.
+JSON_DIR = os.path.join(file_mgmt.BASE_DIR, "01_JSON_Files")
 ANGEL_CREDS_FILE  = os.path.join(JSON_DIR, "harish_angel_one.json")
 ZERODHA_CREDS_FILE = os.path.join(JSON_DIR, "harish_zerodha.json")
 ZERODHA_TOKEN_CACHE = os.path.join(JSON_DIR, "zerodha_access_token.json")

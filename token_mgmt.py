@@ -4,10 +4,13 @@ import pandas as pd
 import requests
 from datetime import datetime
 from ist_clock import now_ist
+import file_mgmt
 
 # Same folder broker_auth.py already uses for the daily Zerodha access-token
 # cache -- keeping the token-mapping cache alongside it.
-JSON_DIR = r"F:\05_Claude_Automation\01_JSON_Files"
+# [CHANGED -- cloud/Colab portability] derives from file_mgmt.BASE_DIR --
+# see file_mgmt.py's BASE_DIR docstring.
+JSON_DIR = os.path.join(file_mgmt.BASE_DIR, "01_JSON_Files")
 os.makedirs(JSON_DIR, exist_ok=True)
 
 

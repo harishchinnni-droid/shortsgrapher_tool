@@ -7,7 +7,12 @@ from datetime import datetime
 from ist_clock import now_ist
 
 # Force Python to recognize your custom codes directory
-CODES_DIR = r"F:\05_Claude_Automation\05 Codes"
+# [CHANGED -- cloud/Colab portability] derives from this file's own
+# location (same convention final_sheet.py/order_sheet.py etc. already
+# use) instead of hardcoding the Windows desktop path -- this constant is
+# "where is this script," not "where is my data," so it doesn't need
+# file_mgmt.BASE_DIR/ALGO_BASE_DIR at all, just needs to stop assuming F:\.
+CODES_DIR = os.path.dirname(os.path.abspath(__file__))
 if CODES_DIR not in sys.path:
     sys.path.append(CODES_DIR)
 
@@ -133,7 +138,15 @@ def run_pipeline_for_date(smart_api, kite_api, target_date, mode):
         raise RuntimeError(f"Step 5 (Historical Ingestion) failed for {target_date.strftime('%d-%b-%y')}: {e}") from e
     print("-" * 60)
 
-    final_excel_path = os.path.join(r"F:\05_Claude_Automation", new_filename)
+    # [CHANGED -- cloud/Colab portability] new_filename is already an
+    # absolute path from file_mgmt.provision_daily_trade_file() (itself
+    # joined onto file_mgmt.BASE_DIR), so this join was always a harmless
+    # no-op on an absolute second argument -- but it silently hardcoded a
+    # SECOND, independent copy of the Windows path that would have been
+    # wrong the moment BASE_DIR pointed anywhere else. Use BASE_DIR
+    # directly so there's only ever one place this pipeline's root is
+    # defined.
+    final_excel_path = os.path.join(file_mgmt.BASE_DIR, new_filename)
 
     # STEP 6: Load the shared 5-minute dataset once, then compute all five
     # indicator matrices IN PARALLEL. Each indicator's build_matrix() does
