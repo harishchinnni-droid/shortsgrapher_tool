@@ -78,6 +78,13 @@ TARGET_SHEET_ID = os.environ.get(
 
 SHEETS_TO_MIRROR = ("Orders", "Dashboard")
 
+# [ADDED -- full-workbook mirror] 'Reference' is the SOURCE template tab
+# in this same spreadsheet (see file_mgmt.py's
+# _build_reference_from_google_sheet) -- it must never be overwritten by
+# a daily output snapshot, so it's excluded even when mirroring
+# "everything" (sheet_names=None below).
+EXCLUDED_FROM_FULL_MIRROR = {"Reference"}
+
 _client = None  # lazy singleton -- one authenticated gspread client per process
 
 
@@ -135,18 +142,30 @@ def _sheet_to_rows(output_excel_path, sheet_name):
     return rows
 
 
-def sync_to_google_sheets(output_excel_path, sheet_names=SHEETS_TO_MIRROR):
-    """Best-effort mirror of the given sheets into the target Google
-    Sheet. Call this AFTER dashboard.build_dashboard_sheet() so both
-    sheets being mirrored are current. No-op (returns immediately) unless
-    ENABLE_SHEETS_SYNC is True."""
+def sync_to_google_sheets(output_excel_path, sheet_names=None):
+    """Best-effort mirror into the target Google Sheet. sheet_names=None
+    (the default) auto-discovers and mirrors EVERY sheet currently in the
+    output workbook -- every indicator matrix, Final, Rejected, Orders,
+    Dashboard -- except 'Reference' (see EXCLUDED_FROM_FULL_MIRROR),
+    so the whole daily tracker is viewable from Sheets, not just
+    Orders/Dashboard. Pass an explicit tuple (e.g. SHEETS_TO_MIRROR) to
+    mirror a smaller subset instead. Call this AFTER
+    dashboard.build_dashboard_sheet() so everything being mirrored is
+    current. No-op (returns immediately) unless ENABLE_SHEETS_SYNC is
+    True."""
     if not ENABLE_SHEETS_SYNC:
         return
 
     import gspread  # safe here -- _get_client() below already requires it to exist
+    from openpyxl import load_workbook
 
     client = _get_client()
     spreadsheet = client.open_by_key(TARGET_SHEET_ID)
+
+    if sheet_names is None:
+        wb = load_workbook(output_excel_path, read_only=True)
+        sheet_names = [s for s in wb.sheetnames if s not in EXCLUDED_FROM_FULL_MIRROR]
+        wb.close()
 
     synced = []
     for sheet_name in sheet_names:
