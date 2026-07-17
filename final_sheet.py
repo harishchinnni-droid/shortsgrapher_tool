@@ -99,6 +99,12 @@ INDICATOR_SHEETS = [
     ("EMA 20",     "EMA 20 Recomm"),
     ("VWAP",       "VWAP Recomm"),
     ("OBV CMF",    "OBV CMF Recomm"),
+    # [ADDED] Passthrough only, same as ADX/BRKPRO above -- see
+    # zerolag.py's docstring for why this doesn't get its own vote here
+    # (it's consumed as an order_sheet.py gate instead, avoiding
+    # double-counting the same trend computation as both a vote and a
+    # gate). Deliberately NOT listed in TREND_SHEETS below.
+    ("ZLTREND",    "ZL Recomm"),
 ]
 
 # "category" (default) = grouped majority per the docstring above.

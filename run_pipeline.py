@@ -43,6 +43,7 @@ try:
     import ema20
     import vwap
     import obv_cmf
+    import zerolag
 except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import pipeline modules: {e}")
     print("Ensure all scripts are saved in the '05 Codes' directory with correct filenames.")
@@ -76,6 +77,12 @@ INDICATORS = [
     ("EMA 20",                 ema20,                "EMA 20"),
     ("VWAP",                   vwap,                 "VWAP"),
     ("OBV CMF",                obv_cmf,              "OBV CMF"),
+    # [ADDED] Zero-Lag EMA/ATR trend cloud + RVOL -- see zerolag.py's
+    # docstring. NOT a final_sheet.py vote (same reasoning as ADX's own
+    # exclusion there); consumed as a pre-entry GATE in order_sheet.py
+    # instead (ENABLE_ZEROLAG_GATE). Still listed here so its own sheet
+    # gets computed/written like every other indicator.
+    ("Zero-Lag Trend",         zerolag,              "ZLTREND"),
 ]
 
 

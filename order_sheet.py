@@ -132,6 +132,7 @@ import position_manager
 import dashboard
 import file_mgmt
 import sheets_sync
+import zerolag
 from ist_clock import today_ist
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -157,6 +158,17 @@ MIN_ENTRY_LTP = 6.0
 ADX_MIN = 18.0
 DEFAULT_STRIKE_STEP = 50
 MAX_POSITIONS_PER_SECTOR = 2
+
+# [ADDED -- Harish's Pine script idea, 17-Jul-26, see zerolag.py] An
+# otherwise-confirmed signal must ALSO have the Zero-Lag trend cloud
+# agreeing with its direction (price on the correct side of the ZLEMA/ATR
+# band right now) AND real volume behind it (RVOL >= ZEROLAG_RVOL_MIN) at
+# the pre-entry bar, or it's rejected. This is meant to make the pipeline
+# pickier, not looser -- fewer, better-confirmed entries. Off by default,
+# same A/B pattern as ENABLE_OI_BUILDUP_GATE/ENABLE_PCR_CONTRARIAN_FLIP --
+# an untested hypothesis until backtested against a live run.
+ENABLE_ZEROLAG_GATE = False
+ZEROLAG_RVOL_MIN = zerolag.RVOL_MIN  # 1.5 -- see zerolag.py's Pine-sourced default
 
 # [CHANGED] PCR is now a TREND gate, not a single-value cutoff -- see
 # PCRTrendTracker. These bands are deliberately WIDER than the old
@@ -628,6 +640,12 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     final_table, sorted_times = _load_final_recomm_table(output_excel_path)
     adx_lookup = _load_metric_lookup(output_excel_path, 'HTF Bias', 'ADX Value')
     atr_lookup = _load_metric_lookup(output_excel_path, 'HTF Bias', 'ATR Value')
+    # [ADDED -- ENABLE_ZEROLAG_GATE] {symbol: {time_str: value}} straight
+    # off the 'ZLTREND' sheet zerolag.py already wrote -- same
+    # _load_metric_lookup() helper as the ADX/ATR lookups above, just a
+    # different source sheet/row.
+    zl_trend_lookup = _load_metric_lookup(output_excel_path, 'ZLTREND', 'Trend Dir')
+    zl_rvol_lookup = _load_metric_lookup(output_excel_path, 'ZLTREND', 'RVOL')
     kite_master = _build_kite_master(kite_api)
     # [FIX -- 13-Jul-26] cache_path=None for BACKTEST keeps the existing,
     # correct "clean slate every run" behavior (fix #5 in the module
@@ -734,6 +752,38 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                 return True
         return False
 
+    def _zerolag_gate_check(sym, signal, t1):
+        """[ADDED -- ENABLE_ZEROLAG_GATE] (ok, detail) for one (sym, t1,
+        signal) -- shared by both the main Phase-1 loop and
+        _try_contrarian_flip() so the two paths can't drift apart. No-op
+        (always ok) when the flag is off, matching every other gate's
+        convention in this file."""
+        if not ENABLE_ZEROLAG_GATE:
+            return True, ""
+
+        zl_dir = zl_trend_lookup.get(sym, {}).get(t1)
+        zl_rvol = zl_rvol_lookup.get(sym, {}).get(t1)
+        try:
+            zl_dir = int(float(zl_dir)) if zl_dir is not None else None
+        except (TypeError, ValueError):
+            zl_dir = None
+        try:
+            zl_rvol = float(zl_rvol) if zl_rvol is not None else None
+        except (TypeError, ValueError):
+            zl_rvol = None
+
+        expected_dir = 1 if signal == 'BUY CE' else -1 if signal == 'BUY PE' else None
+        dir_ok = expected_dir is not None and zl_dir == expected_dir
+        rvol_ok = zl_rvol is not None and zl_rvol >= ZEROLAG_RVOL_MIN
+
+        if dir_ok and rvol_ok:
+            return True, ""
+
+        zl_dir_label = {1: 'BUY CE', -1: 'BUY PE', 0: 'WAIT', None: 'N/A'}.get(zl_dir, 'N/A')
+        rvol_label = f"{zl_rvol:.2f}" if zl_rvol is not None else "N/A"
+        return False, (f"Zero-Lag gate failed (cloud trend {zl_dir_label}, RVOL {rvol_label} "
+                        f"< {ZEROLAG_RVOL_MIN}). Cloud/volume doesn't confirm this move.")
+
     def _try_contrarian_flip(sym, original_signal, t1, spot_price):
         """[ADDED -- ENABLE_PCR_CONTRARIAN_FLIP, Harish's idea, 16-Jul-26]
         Called only when the ORIGINAL momentum-confluence signal
@@ -790,6 +840,10 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             pre_entry_adx = None
         if pre_entry_adx is not None and pre_entry_adx < ADX_MIN:
             return None, f"{opt_symbol}: [Contrarian Flip] Low momentum / choppy regime (ADX {pre_entry_adx:.1f} < {ADX_MIN}). Skipping."
+
+        zl_ok, zl_detail = _zerolag_gate_check(sym, flipped_signal, t1)
+        if not zl_ok:
+            return None, f"{opt_symbol}: [Contrarian Flip] {zl_detail}"
 
         as_of_date = target_date.date() if is_backtest else datetime.now(IST).date()
         is_expiry_day, is_expiry_week, days_to_expiry = get_expiry_context(sym, df_ref, as_of_date)
@@ -1062,6 +1116,14 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         pre_entry_adx = None
                     if pre_entry_adx is not None and pre_entry_adx < ADX_MIN:
                         reason = f"{opt_symbol}: Low momentum / choppy regime (ADX {pre_entry_adx:.1f} < {ADX_MIN}). Skipping."
+                        print(f"[REJECTED] {sym} -> {reason}")
+                        _log_rejection(sym, t1, s1, reason)
+                        current_signal_streak = None
+                        continue
+
+                    zl_ok, zl_detail = _zerolag_gate_check(sym, s1, t1)
+                    if not zl_ok:
+                        reason = f"{opt_symbol}: {zl_detail}"
                         print(f"[REJECTED] {sym} -> {reason}")
                         _log_rejection(sym, t1, s1, reason)
                         current_signal_streak = None
