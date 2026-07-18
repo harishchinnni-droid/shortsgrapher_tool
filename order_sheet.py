@@ -164,10 +164,18 @@ MAX_POSITIONS_PER_SECTOR = 2
 # agreeing with its direction (price on the correct side of the ZLEMA/ATR
 # band right now) AND real volume behind it (RVOL >= ZEROLAG_RVOL_MIN) at
 # the pre-entry bar, or it's rejected. This is meant to make the pipeline
-# pickier, not looser -- fewer, better-confirmed entries. Off by default,
-# same A/B pattern as ENABLE_OI_BUILDUP_GATE/ENABLE_PCR_CONTRARIAN_FLIP --
-# an untested hypothesis until backtested against a live run.
-ENABLE_ZEROLAG_GATE = False
+# pickier, not looser -- fewer, better-confirmed entries.
+#
+# [CHANGED -- 18-Jul-26, Task 41 A/B] Temporarily flipped ON to run the
+# actual multi-day backtest this flag has needed since it was added. A
+# single-day replay against 17-Jul-26 (6 trades, gate would have kept 1)
+# showed the gate rejecting purely on RVOL, not direction -- promising on
+# that one day but not proof; needs the full 01-15 Jul range to mean
+# anything. OFF-baseline for that range already captured before this run:
+# 38 trades, Net P/L -Rs 4,719.77, 44.7% win rate (see task 41 notes).
+# Flip back to False after this A/B once the ON-range results are in and
+# compared, unless the delta clearly favors leaving it on.
+ENABLE_ZEROLAG_GATE = True
 ZEROLAG_RVOL_MIN = zerolag.RVOL_MIN  # 1.5 -- see zerolag.py's Pine-sourced default
 
 # [CHANGED] PCR is now a TREND gate, not a single-value cutoff -- see
