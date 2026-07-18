@@ -1344,6 +1344,22 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
 def write_order_sheet(df_orders, df_rejected, output_excel_path):
     """Writes/replaces the 'Orders' and 'Rejected' sheets, then autofits
     just those two and atomically re-saves."""
+    # [CHANGED -- 17-Jul-26, Harish's request] Both sheets used to land in
+    # whatever order build_order_sheet()'s per-symbol loop produced them
+    # (effectively Symbol-ascending, since that loop walks df_ref's
+    # Reference rows in symbol order) -- sorted here instead by the
+    # trade's own Pre-Entry Time / Trigger Time so the sheet reads
+    # chronologically (what happened first in the session), tie-broken by
+    # Symbol ascending for entries sharing the same bar.
+    if not df_orders.empty and 'Pre-Entry Trigger Time' in df_orders.columns:
+        df_orders = df_orders.sort_values(
+            by=['Pre-Entry Trigger Time', 'Symbol'], na_position='last', ignore_index=True
+        )
+    if not df_rejected.empty and 'Trigger Time' in df_rejected.columns:
+        df_rejected = df_rejected.sort_values(
+            by=['Trigger Time', 'Symbol'], na_position='last', ignore_index=True
+        )
+
     with pd.ExcelWriter(output_excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
         df_orders.to_excel(writer, sheet_name='Orders', index=False)
         df_rejected.to_excel(writer, sheet_name='Rejected', index=False)
@@ -1519,6 +1535,14 @@ def update_open_positions_live(kite_api, output_excel_path):
             dd_guard.update(net_pl, at_time_str=now.strftime('%H:%M:%S'))
 
     if changed:
+        # [CHANGED -- 17-Jul-26] Same Pre-Entry-Time sort as
+        # write_order_sheet() -- keeps LIVE's per-cycle re-write from
+        # drifting back to Symbol-ascending order after every position
+        # update.
+        if not df_orders.empty and 'Pre-Entry Trigger Time' in df_orders.columns:
+            df_orders = df_orders.sort_values(
+                by=['Pre-Entry Trigger Time', 'Symbol'], na_position='last', ignore_index=True
+            )
         with pd.ExcelWriter(output_excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
             df_orders.to_excel(writer, sheet_name='Orders', index=False)
         wb = load_workbook(output_excel_path)

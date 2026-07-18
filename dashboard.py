@@ -49,7 +49,6 @@ from datetime import datetime
 import pandas as pd
 import pytz
 from openpyxl import load_workbook
-from openpyxl.chart import LineChart, Reference
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -320,8 +319,13 @@ def build_dashboard_sheet(output_excel_path, mode=None, target_date=None):
 
     # --- Equity curve: chronological cumulative P/L, for reading back HOW
     # the session's total was reached, not just what it totaled. Table
-    # always written; a line chart is added whenever there are at least
-    # 2 points to draw a line between.
+    # always written.
+    # [REMOVED -- 17-Jul-26, Harish's request] The embedded LineChart
+    # visual wasn't helping analysis (too coarse for the trade counts this
+    # pipeline sees per day) and was removed. The data table below is
+    # UNCHANGED -- every column/row still written exactly as before -- so
+    # nothing downstream that reads this sheet's values is affected, only
+    # the chart object itself is gone.
     ws.append([])
     ws.append([None, "EQUITY CURVE (chronological, resolved trades only)"])
     ws.cell(row=ws.max_row, column=2).font = FONT_BOLD
@@ -329,22 +333,8 @@ def build_dashboard_sheet(output_excel_path, mode=None, target_date=None):
     ws.append([None, "#", "Exit Time", "Symbol", "Trade P/L (Rs)", "Cumulative P/L (Rs)"])
     for c in range(2, 7):
         ws.cell(row=ws.max_row, column=c).font = FONT_BOLD
-    equity_first_data_row = ws.max_row + 1
     for i, point in enumerate(stats['equity_curve'], start=1):
         ws.append([None, i, point['time'], point['symbol'], point['trade_pl'], point['cumulative_pl']])
-    equity_last_data_row = ws.max_row
-
-    if len(stats['equity_curve']) >= 2:
-        chart = LineChart()
-        chart.title = "Cumulative P/L"
-        chart.y_axis.title = "Rs"
-        chart.x_axis.title = "Trade #"
-        chart.width, chart.height = 22, 9
-        data_ref = Reference(ws, min_col=6, min_row=equity_header_row, max_row=equity_last_data_row)
-        cats_ref = Reference(ws, min_col=2, min_row=equity_first_data_row, max_row=equity_last_data_row)
-        chart.add_data(data_ref, titles_from_data=True)
-        chart.set_categories(cats_ref)
-        ws.add_chart(chart, f"I{equity_header_row}")
 
     ws.append([])
     ws.append([None, "HOURLY P&L BREAKDOWN"])
