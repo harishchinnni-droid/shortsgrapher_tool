@@ -972,12 +972,33 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         this function for how each symbol is now isolated."""
         current_signal_streak = None
         active_trade_key = None
+        # [ADDED -- Task 46, Harish's 18-Jul-26 audit] Tracks the raw,
+        # single-bar underlying Final Recomm value of whatever continuous
+        # run is currently in progress, and whether THAT run has already
+        # been through a full gate-chain audit once. Without this, a
+        # rejected 3-bar streak (t1=10:10) re-qualifies as a "new" 3-bar
+        # streak on the very next bar (t1=10:15) for as long as the raw
+        # signal simply keeps holding -- one continuous BUY CE run was
+        # generating a rejection row on EVERY bar instead of one audit for
+        # the whole run, exactly the "rejecting at every candle" behavior
+        # Harish flagged. This makes it ONE audit per continuous run,
+        # matching how a discretionary trader reads a persisting signal:
+        # you don't re-ask "is this a buy?" every 5 minutes the same trend
+        # just continues to hold -- you asked once, at the point it first
+        # looked like 3 bars of confluence, and you live with that answer
+        # until the signal itself actually changes.
+        run_signal = None
+        run_audited = False
 
         for i in range(len(sorted_times) - 2):
             t1, t2, t3 = sorted_times[i], sorted_times[i + 1], sorted_times[i + 2]
             s1 = time_map.get(t1, "WAIT")
             s2 = time_map.get(t2, "WAIT")
             s3 = time_map.get(t3, "WAIT")
+
+            if s1 != run_signal:
+                run_signal = s1
+                run_audited = False
 
             # [ADDED -- risk_and_signal_patches audit] Eager PCR recording,
             # see ENABLE_EAGER_PCR_RECORDING docstring above. Fires on any
@@ -1010,6 +1031,14 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             if current_signal_streak is None:
                 if not (s1 == s2 == s3 and s1 in ("BUY CE", "BUY PE")):
                     continue
+
+                # [ADDED -- Task 46] This exact run already went through
+                # the gate chain once (accepted or rejected) -- see
+                # run_signal/run_audited setup above. Skip re-auditing
+                # every subsequent bar of the same continuous signal.
+                if run_audited:
+                    continue
+                run_audited = True
 
                 current_signal_streak = s1
                 key = f"{sym}_{t1}"
