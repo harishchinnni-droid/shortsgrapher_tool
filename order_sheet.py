@@ -117,6 +117,7 @@ import sys
 import json
 import time
 from datetime import datetime
+from datetime import time as dtime  # [ADDED -- Task 49] time-of-day constants; 'time' above is the stdlib module
 
 import pandas as pd
 import pytz
@@ -158,6 +159,18 @@ MIN_ENTRY_LTP = 6.0
 ADX_MIN = 18.0
 DEFAULT_STRIKE_STEP = 50
 MAX_POSITIONS_PER_SECTOR = 2
+
+# [ADDED -- 18-Jul-26, Task 49, Harish's training material] NSE intraday
+# volume/liquidity thins out around midday -- 12:00-1:00pm is the
+# commonly-cited low-liquidity chop window (wide spreads, low
+# conviction, more prone to whipsaw). Off by default -- an untested
+# hypothesis like every other experimental gate here; the WINDOW itself
+# is a well-known intraday pattern, but whether blocking new entries in
+# it actually improves THIS pipeline's results (vs. just cutting trade
+# count) still needs its own A/B backtest.
+ENABLE_LOW_LIQUIDITY_WINDOW_GATE = False
+LOW_LIQUIDITY_WINDOW_START = dtime(12, 0)
+LOW_LIQUIDITY_WINDOW_END = dtime(13, 0)
 
 # [ADDED -- Harish's Pine script idea, 17-Jul-26, see zerolag.py] An
 # otherwise-confirmed signal must ALSO have the Zero-Lag trend cloud
@@ -1072,6 +1085,21 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                 key = f"{sym}_{t1}"
 
                 if key not in existing_orders:
+                    # [ADDED -- Task 49, Harish's training material] Cheap,
+                    # pure time-of-day check -- deliberately first in this
+                    # chain so it short-circuits before any of the more
+                    # expensive lookups/API calls below run at all.
+                    if ENABLE_LOW_LIQUIDITY_WINDOW_GATE:
+                        t1_clock = datetime.strptime(t1, "%H:%M").time()
+                        if LOW_LIQUIDITY_WINDOW_START <= t1_clock < LOW_LIQUIDITY_WINDOW_END:
+                            reason = (f"{sym}: Pre-entry bar ({t1}) falls in the low-liquidity "
+                                      f"window ({LOW_LIQUIDITY_WINDOW_START.strftime('%H:%M')}-"
+                                      f"{LOW_LIQUIDITY_WINDOW_END.strftime('%H:%M')}). Skipping.")
+                            print(f"[REJECTED] {sym} -> {reason}")
+                            _log_rejection(sym, t1, s1, reason)
+                            current_signal_streak = None
+                            continue
+
                     if not position_manager.ENABLE_SIGNAL_REVERSAL_EXIT and has_open_position_in_symbol(sym):
                         reason = f"{sym}: position already open in this symbol -- skipping new entry until it closes."
                         print(f"[REJECTED] {sym} -> {reason}")
