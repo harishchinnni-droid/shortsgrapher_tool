@@ -176,14 +176,39 @@ MAX_POSITIONS_PER_SECTOR = 2
 # Flip back to False after this A/B once the ON-range results are in and
 # compared, unless the delta clearly favors leaving it on.
 ENABLE_ZEROLAG_GATE = True
-ZEROLAG_RVOL_MIN = zerolag.RVOL_MIN  # 1.5 -- see zerolag.py's Pine-sourced default
+ZEROLAG_RVOL_MIN = zerolag.RVOL_MIN  # 0.8 as of 18-Jul-26 recalibration -- see zerolag.py
+
+# [ADDED -- 18-Jul-26, Task 41 Q1] The chart's own 'X' cross marker for
+# this indicator fires only on the exact bar a trend flips (edge-
+# triggered), but zerolag.py's Trend Dir is a PERSISTENT state -- a flip
+# from 40 bars ago reads identically to one from the last bar. This adds
+# a genuine freshness check on top of the existing direction+RVOL checks:
+# the flip backing this signal must be within ZEROLAG_MAX_FLIP_AGE bars
+# of the pre-entry bar, i.e. actually mimic what the X marker means
+# instead of "cloud agrees, whenever that started being true." Separate
+# flag from ENABLE_ZEROLAG_GATE itself so it can be A/B'd independently.
+ENABLE_ZEROLAG_FRESHNESS = True
+ZEROLAG_MAX_FLIP_AGE = 3  # bars (5min candles) -- 15 minutes since the flip
 
 # [CHANGED] PCR is now a TREND gate, not a single-value cutoff -- see
 # PCRTrendTracker. These bands are deliberately WIDER than the old
 # PCR_CE_MIN=0.6 / PCR_PE_MAX=1.3 hard cutoffs, because the level alone no
 # longer rejects a trade; level AND trend direction both have to agree.
-PCR_TREND_BAND_CE = 0.75
-PCR_TREND_BAND_PE = 1.15
+#
+# [CHANGED -- 18-Jul-26, Task 41 Q4] Widened further (CE 0.75->0.65, PE
+# 1.15->1.25): PCR was the #2 rejector in the 01-17 Jul rejection-log
+# audit (254 of 864 total rejections), largely "Overbought/Oversold Trap"
+# band rejections. This is a rough ~13% widening, NOT derived from this
+# data the way the RVOL_MIN change was -- treat it as a starting point to
+# be judged by this same backtest pass, not a settled number.
+# PCR_REQUIRE_SUFFICIENT_DATA / PCR_TREND_MIN_READINGS below are
+# DELIBERATELY untouched -- that guard exists because the "insufficient
+# data" bucket was the single worst-performing PCR state across two
+# earlier independent samples (see that flag's own docstring); loosening
+# band width is not the same as removing that guard, and doing the
+# latter would knowingly reintroduce an already-fixed loss pattern.
+PCR_TREND_BAND_CE = 0.65
+PCR_TREND_BAND_PE = 1.25
 PCR_TREND_MIN_READINGS = 3
 
 # [ADDED -- 16-Jul-26 audit, 01-15 Jul 26 sample: 42 trades, -Rs 9,742 net,
@@ -661,6 +686,9 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # different source sheet/row.
     zl_trend_lookup = _load_metric_lookup(output_excel_path, 'ZLTREND', 'Trend Dir')
     zl_rvol_lookup = _load_metric_lookup(output_excel_path, 'ZLTREND', 'RVOL')
+    # [ADDED -- ENABLE_ZEROLAG_FRESHNESS] {symbol: {time_str: bars_since_flip}}
+    # -- see zerolag.py's 'Flip Age' row and this flag's own docstring above.
+    zl_flip_age_lookup = _load_metric_lookup(output_excel_path, 'ZLTREND', 'Flip Age')
     kite_master = _build_kite_master(kite_api)
     # [FIX -- 13-Jul-26] cache_path=None for BACKTEST keeps the existing,
     # correct "clean slate every run" behavior (fix #5 in the module
@@ -772,12 +800,21 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         signal) -- shared by both the main Phase-1 loop and
         _try_contrarian_flip() so the two paths can't drift apart. No-op
         (always ok) when the flag is off, matching every other gate's
-        convention in this file."""
+        convention in this file.
+
+        [CHANGED -- ENABLE_ZEROLAG_FRESHNESS] Added a third check on top
+        of direction+RVOL: the flip backing this trend agreement must be
+        recent (see zerolag.py's 'Flip Age' / bars_since_flip). Without
+        this, 'cloud trend agrees' can be true because of a flip from an
+        hour ago -- not the same thing as the chart's own 'X' cross
+        marker, which only fires on the actual flip bar. Independently
+        toggleable from ENABLE_ZEROLAG_GATE itself."""
         if not ENABLE_ZEROLAG_GATE:
             return True, ""
 
         zl_dir = zl_trend_lookup.get(sym, {}).get(t1)
         zl_rvol = zl_rvol_lookup.get(sym, {}).get(t1)
+        zl_flip_age = zl_flip_age_lookup.get(sym, {}).get(t1)
         try:
             zl_dir = int(float(zl_dir)) if zl_dir is not None else None
         except (TypeError, ValueError):
@@ -786,18 +823,28 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             zl_rvol = float(zl_rvol) if zl_rvol is not None else None
         except (TypeError, ValueError):
             zl_rvol = None
+        try:
+            zl_flip_age = int(float(zl_flip_age)) if zl_flip_age is not None else None
+        except (TypeError, ValueError):
+            zl_flip_age = None
 
         expected_dir = 1 if signal == 'BUY CE' else -1 if signal == 'BUY PE' else None
         dir_ok = expected_dir is not None and zl_dir == expected_dir
         rvol_ok = zl_rvol is not None and zl_rvol >= ZEROLAG_RVOL_MIN
+        fresh_ok = (not ENABLE_ZEROLAG_FRESHNESS) or (
+            zl_flip_age is not None and zl_flip_age <= ZEROLAG_MAX_FLIP_AGE
+        )
 
-        if dir_ok and rvol_ok:
+        if dir_ok and rvol_ok and fresh_ok:
             return True, ""
 
         zl_dir_label = {1: 'BUY CE', -1: 'BUY PE', 0: 'WAIT', None: 'N/A'}.get(zl_dir, 'N/A')
         rvol_label = f"{zl_rvol:.2f}" if zl_rvol is not None else "N/A"
+        age_label = str(zl_flip_age) if zl_flip_age is not None else "N/A"
         return False, (f"Zero-Lag gate failed (cloud trend {zl_dir_label}, RVOL {rvol_label} "
-                        f"< {ZEROLAG_RVOL_MIN}). Cloud/volume doesn't confirm this move.")
+                        f"< {ZEROLAG_RVOL_MIN}, flip age {age_label} bars "
+                        f"{'> ' + str(ZEROLAG_MAX_FLIP_AGE) if ENABLE_ZEROLAG_FRESHNESS else '(freshness off)'}). "
+                        f"Cloud/volume/freshness doesn't confirm this move.")
 
     def _try_contrarian_flip(sym, original_signal, t1, spot_price):
         """[ADDED -- ENABLE_PCR_CONTRARIAN_FLIP, Harish's idea, 16-Jul-26]

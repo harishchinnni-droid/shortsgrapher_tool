@@ -80,7 +80,17 @@ ZL_LEN = 34          # `zlLen` -- Zero-Lag EMA length
 ATR_LEN = 14         # `atrLen`
 BAND_MULT = 1.2      # `bandMult` -- cloud width, x ATR
 VOL_LEN = 20         # `volLen` -- RVOL average window
-RVOL_MIN = 1.5       # `rvolMin` -- used by order_sheet.py's gate, not here
+# [CHANGED -- 18-Jul-26, Task 41 rejection-log audit] Was 1.5 (the Pine
+# script's own default). Across the full 01-17 Jul 26 sample, 302/309
+# (98%) of this gate's rejections failed ONLY on this RVOL check -- median
+# actual RVOL of a rejected, otherwise-confirmed setup was 0.65. The
+# Pine default is calibrated for whatever instrument/timeframe its author
+# tested on, not NSE F&O 5-min candles across this ~48-symbol watchlist.
+# 0.8 is a recalibration to this pipeline's own real data, not a second
+# guess -- still meaningfully above 1.0 (average volume), just not
+# rejecting nearly everything. Needs its own before/after check in the
+# next backtest (see order_sheet.py's ENABLE_ZEROLAG_GATE A/B).
+RVOL_MIN = 0.8       # `rvolMin` -- used by order_sheet.py's gate, not here
 CUTOFF_TIME = dtime(15, 15)
 INTERVAL = "5minute"
 
@@ -156,8 +166,22 @@ def calculate_zerolag(df, zl_len=ZL_LEN, atr_len=ATR_LEN, band_mult=BAND_MULT, v
     # clears the WHOLE band, otherwise it holds its last value. Not
     # vectorizable (each bar depends on the previous bar's decision, not
     # just this bar's inputs), but cheap at intraday row counts.
+    # [ADDED -- 18-Jul-26, Task 41 Q1] `trend_dir` above is a PERSISTENT
+    # state (matches this workbook's convention -- see module docstring),
+    # but the actual chart indicator Harish is looking at plots a cross
+    # ('X') marker only on the bar a flip occurs -- an EDGE-triggered
+    # event, not "currently in this trend". A gate that only checks
+    # trend_dir agreement can't tell a flip that happened 40 bars ago
+    # from one that just happened -- `bars_since_flip` (0 on the flip bar
+    # itself, incrementing every bar the trend HOLDS) restores that
+    # distinction so a caller can require freshness, i.e. actually mimic
+    # what the chart's X marker means, instead of "cloud agrees, whenever
+    # that started being true." See order_sheet.py's
+    # ENABLE_ZEROLAG_FRESHNESS / ZEROLAG_MAX_FLIP_AGE.
+    bars_since_flip = np.zeros(n, dtype=int)
     trend_dir = np.zeros(n, dtype=int)
     state = 0
+    age = 0
     zlema_np = zlema.to_numpy()
     upper_np = upper.to_numpy()
     lower_np = lower.to_numpy()
@@ -165,12 +189,20 @@ def calculate_zerolag(df, zl_len=ZL_LEN, atr_len=ATR_LEN, band_mult=BAND_MULT, v
     for i in range(n):
         if np.isnan(zlema_np[i]) or np.isnan(upper_np[i]) or np.isnan(lower_np[i]):
             trend_dir[i] = state
+            bars_since_flip[i] = age
             continue
+        new_state = state
         if close_np[i] > upper_np[i]:
-            state = 1
+            new_state = 1
         elif close_np[i] < lower_np[i]:
-            state = -1
+            new_state = -1
+        if new_state != state:
+            age = 0
+        else:
+            age += 1
+        state = new_state
         trend_dir[i] = state
+        bars_since_flip[i] = age
 
     # --- Relative Volume: current volume vs its own rolling average ---
     if 'volume' in df.columns:
@@ -183,6 +215,7 @@ def calculate_zerolag(df, zl_len=ZL_LEN, atr_len=ATR_LEN, band_mult=BAND_MULT, v
     df['Zero-Lag Line'] = zlema.to_numpy()
     df['Trend Dir'] = trend_dir
     df['RVOL'] = rvol
+    df['Flip Age'] = bars_since_flip  # [ADDED -- Task 41 Q1] bars since the last trend flip; 0 = flip bar itself
     df['ZL Recomm'] = np.where(trend_dir == 1, 'BUY CE', np.where(trend_dir == -1, 'BUY PE', 'WAIT'))
 
     return df
@@ -292,6 +325,7 @@ def build_matrix(data_dict, target_date, max_workers=None):
         matrix_rows.append(get_metric_row('Zero-Lag Line', 'Zero-Lag Line'))
         matrix_rows.append(get_metric_row('Trend Dir', 'Trend Dir'))
         matrix_rows.append(get_metric_row('RVOL', 'RVOL'))
+        matrix_rows.append(get_metric_row('Flip Age', 'Flip Age'))  # [ADDED -- Task 41 Q1]
         matrix_rows.append(get_metric_row('ZL Recomm', 'ZL Recomm'))
 
     return matrix_rows
