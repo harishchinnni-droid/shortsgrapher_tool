@@ -55,15 +55,18 @@ the phone/browser view is stale until the next successful sync.
 import os
 import file_mgmt
 
-# [FLAG] One-time setup (see docstring) is done -- service account JSON
-# is in 01_JSON_Files, and 01_SourceFile has been shared with it as
-# Editor (see TARGET_SHEET_ID below: this reuses that existing sheet
-# rather than a separate dedicated one -- new 'Orders'/'Dashboard' tabs
-# get added alongside 'Reference'/'Copy of Reference 2' without touching
-# them, since sync_to_google_sheets() only ever writes to sheet names in
-# SHEETS_TO_MIRROR). Can still be overridden off via env var if needed:
-#   os.environ["ENABLE_SHEETS_SYNC"] = "0"
-ENABLE_SHEETS_SYNC = os.environ.get("ENABLE_SHEETS_SYNC", "1") == "1"
+# [FLAG] [CHANGED -- 18-Jul-26, back to pure local setup] Harish moved to
+# Colab so this pipeline would also run from his office system, but Colab
+# itself turned out unreliable there (repeated Chrome/session/runtime
+# issues across multiple sessions). Rolling back to the original local-
+# only setup: everything under F:\05_Claude_Automation, 01_SourceFile.xlsx
+# as the real source file, no Google Sheets involved. This flag now
+# defaults OFF -- the sync code/setup instructions below are left in
+# place (fully dormant, zero effect while this is False) in case cloud
+# access is wanted again later, but nothing calls out to Google Sheets
+# unless this is explicitly re-enabled:
+#   os.environ["ENABLE_SHEETS_SYNC"] = "1"
+ENABLE_SHEETS_SYNC = os.environ.get("ENABLE_SHEETS_SYNC", "0") == "1"
 
 JSON_DIR = os.path.join(file_mgmt.BASE_DIR, "01_JSON_Files")
 SERVICE_ACCOUNT_FILE = os.path.join(JSON_DIR, "google_service_account.json")
