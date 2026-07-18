@@ -213,6 +213,16 @@ ZEROLAG_MAX_FLIP_AGE = 3  # bars (5min candles) -- 15 minutes since the flip
 # doesn't confound that comparison.
 ENABLE_SUPERTREND_GATE = False
 
+# [ADDED -- 18-Jul-26, Task 50] An otherwise-confirmed signal must also
+# have a RECENT, volume-confirmed Support/Resistance break agreeing with
+# its direction (see support_resistance.py) -- a genuinely different
+# dimension from the oscillator-based gates above (price actually
+# breaking a real structural level with volume, not just an indicator
+# threshold). Off by default -- untested hypothesis, needs its own A/B
+# backtest, same as every other experimental gate here.
+ENABLE_SR_GATE = False
+SR_MAX_BREAK_AGE = 3  # bars (5min candles) -- 15 minutes since the break, same window as ZeroLag's freshness check
+
 # [CHANGED] PCR is now a TREND gate, not a single-value cutoff -- see
 # PCRTrendTracker. These bands are deliberately WIDER than the old
 # PCR_CE_MIN=0.6 / PCR_PE_MAX=1.3 hard cutoffs, because the level alone no
@@ -715,6 +725,13 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # [ADDED -- ENABLE_SUPERTREND_GATE] {symbol: {time_str: 'BUY CE'/'BUY PE'/'WAIT'}}
     # straight off the 'Supertrend' sheet supertrend_ai.py writes.
     supertrend_lookup = _load_metric_lookup(output_excel_path, 'Supertrend', 'Supertrend Recomm')
+    # [ADDED -- ENABLE_SR_GATE] {symbol: {time_str: value}} lookups off
+    # the 'SUPRES' sheet support_resistance.py writes. 'Last Break Dir'
+    # (persistent, like zerolag's Trend Dir) is used rather than the
+    # edge-triggered 'SR Recomm', since a pre-entry bar rarely lands
+    # exactly on the break bar itself -- see that column's own docstring.
+    sr_break_dir_lookup = _load_metric_lookup(output_excel_path, 'SUPRES', 'Last Break Dir')
+    sr_break_age_lookup = _load_metric_lookup(output_excel_path, 'SUPRES', 'SR Break Age')
     kite_master = _build_kite_master(kite_api)
     # [FIX -- 13-Jul-26] cache_path=None for BACKTEST keeps the existing,
     # correct "clean slate every run" behavior (fix #5 in the module
@@ -886,6 +903,37 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         st_label = st_recomm if st_recomm else "N/A"
         return False, (f"SuperTrend AI gate failed (adaptive trend reads {st_label}, "
                         f"signal wants {signal}). Trend disagreement.")
+
+    def _sr_gate_check(sym, signal, t1):
+        """[ADDED -- ENABLE_SR_GATE, Task 50] (ok, detail) for one
+        (sym, t1, signal) -- same shared-helper pattern as
+        _zerolag_gate_check(). No-op (always ok) when the flag is off."""
+        if not ENABLE_SR_GATE:
+            return True, ""
+
+        sr_dir = sr_break_dir_lookup.get(sym, {}).get(t1)
+        sr_age = sr_break_age_lookup.get(sym, {}).get(t1)
+        try:
+            sr_dir = int(float(sr_dir)) if sr_dir is not None else None
+        except (TypeError, ValueError):
+            sr_dir = None
+        try:
+            sr_age = int(float(sr_age)) if sr_age is not None else None
+        except (TypeError, ValueError):
+            sr_age = None
+
+        expected_dir = 1 if signal == 'BUY CE' else -1 if signal == 'BUY PE' else None
+        dir_ok = expected_dir is not None and sr_dir == expected_dir
+        fresh_ok = sr_age is not None and 0 <= sr_age <= SR_MAX_BREAK_AGE
+
+        if dir_ok and fresh_ok:
+            return True, ""
+
+        sr_dir_label = {1: 'Resistance Break (bullish)', -1: 'Support Break (bearish)', 0: 'None yet', None: 'N/A'}.get(sr_dir, 'N/A')
+        age_label = str(sr_age) if sr_age is not None else "N/A"
+        return False, (f"Support/Resistance gate failed (last break: {sr_dir_label}, "
+                        f"{age_label} bars ago, needs <= {SR_MAX_BREAK_AGE}). "
+                        f"No recent, direction-agreeing structural break.")
 
     def _try_contrarian_flip(sym, original_signal, t1, spot_price):
         """[ADDED -- ENABLE_PCR_CONTRARIAN_FLIP, Harish's idea, 16-Jul-26]
@@ -1279,6 +1327,14 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     st_ok, st_detail = _supertrend_gate_check(sym, s1, t1)
                     if not st_ok:
                         reason = f"{opt_symbol}: {st_detail}"
+                        print(f"[REJECTED] {sym} -> {reason}")
+                        _log_rejection(sym, t1, s1, reason)
+                        current_signal_streak = None
+                        continue
+
+                    sr_ok, sr_detail = _sr_gate_check(sym, s1, t1)
+                    if not sr_ok:
+                        reason = f"{opt_symbol}: {sr_detail}"
                         print(f"[REJECTED] {sym} -> {reason}")
                         _log_rejection(sym, t1, s1, reason)
                         current_signal_streak = None

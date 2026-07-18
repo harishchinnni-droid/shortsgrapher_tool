@@ -50,6 +50,11 @@ try:
     # change and would have crashed immediately if added here as-is. Now
     # fixed and added below, same as every other trend indicator.
     import supertrend_ai
+    # [ADDED -- 18-Jul-26, Task 50] LuxAlgo "Support and Resistance Levels
+    # with Breaks" -- see support_resistance.py's docstring. Reference
+    # Pine Script was already sitting in 04_ProjectFiles; this module was
+    # newly built, no interface issue to fix (unlike SuperTrend AI above).
+    import support_resistance
 except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import pipeline modules: {e}")
     print("Ensure all scripts are saved in the '05 Codes' directory with correct filenames.")
@@ -98,6 +103,12 @@ INDICATORS = [
     # (ENABLE_SUPERTREND_GATE) so it can be A/B tested on its own,
     # independent of the still-pending Zero-Lag/PCR re-test.
     ("SuperTrend AI",          supertrend_ai,        "Supertrend"),
+    # [ADDED -- 18-Jul-26, Task 50] LuxAlgo Support/Resistance with
+    # volume-confirmed breaks -- see support_resistance.py's docstring.
+    # NOT a final_sheet.py vote (structural/positional signal, a
+    # different dimension from TREND/MOMENTUM/VOLUME); consumed as an
+    # off-by-default pre-entry GATE in order_sheet.py (ENABLE_SR_GATE).
+    ("Support/Resistance",     support_resistance,   "SUPRES"),
 ]
 
 
