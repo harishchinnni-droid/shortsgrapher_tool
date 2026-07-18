@@ -223,6 +223,16 @@ ENABLE_SUPERTREND_GATE = False
 ENABLE_SR_GATE = False
 SR_MAX_BREAK_AGE = 3  # bars (5min candles) -- 15 minutes since the break, same window as ZeroLag's freshness check
 
+# [ADDED -- 18-Jul-26, Task 51] An otherwise-confirmed signal must also
+# have a RECENT Smart Money Concepts order-block retest agreeing with
+# its direction (see smart_money_concepts.py) -- structural/order-flow
+# confirmation, a different dimension again from the gates above. Off by
+# default -- first version of a genuinely new signal paradigm for this
+# codebase, needs its own A/B backtest before being trusted, same as
+# every other experimental gate here.
+ENABLE_SMC_GATE = False
+SMC_MAX_ZONE_AGE = 3  # bars (5min candles) -- 15 minutes since the retest
+
 # [CHANGED] PCR is now a TREND gate, not a single-value cutoff -- see
 # PCRTrendTracker. These bands are deliberately WIDER than the old
 # PCR_CE_MIN=0.6 / PCR_PE_MAX=1.3 hard cutoffs, because the level alone no
@@ -732,6 +742,10 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # exactly on the break bar itself -- see that column's own docstring.
     sr_break_dir_lookup = _load_metric_lookup(output_excel_path, 'SUPRES', 'Last Break Dir')
     sr_break_age_lookup = _load_metric_lookup(output_excel_path, 'SUPRES', 'SR Break Age')
+    # [ADDED -- ENABLE_SMC_GATE] {symbol: {time_str: value}} lookups off
+    # the 'SMC' sheet smart_money_concepts.py writes.
+    smc_dir_lookup = _load_metric_lookup(output_excel_path, 'SMC', 'Last OB Dir')
+    smc_age_lookup = _load_metric_lookup(output_excel_path, 'SMC', 'SMC Zone Age')
     kite_master = _build_kite_master(kite_api)
     # [FIX -- 13-Jul-26] cache_path=None for BACKTEST keeps the existing,
     # correct "clean slate every run" behavior (fix #5 in the module
@@ -934,6 +948,37 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         return False, (f"Support/Resistance gate failed (last break: {sr_dir_label}, "
                         f"{age_label} bars ago, needs <= {SR_MAX_BREAK_AGE}). "
                         f"No recent, direction-agreeing structural break.")
+
+    def _smc_gate_check(sym, signal, t1):
+        """[ADDED -- ENABLE_SMC_GATE, Task 51] (ok, detail) for one
+        (sym, t1, signal) -- same shared-helper pattern as
+        _zerolag_gate_check(). No-op (always ok) when the flag is off."""
+        if not ENABLE_SMC_GATE:
+            return True, ""
+
+        smc_dir = smc_dir_lookup.get(sym, {}).get(t1)
+        smc_age = smc_age_lookup.get(sym, {}).get(t1)
+        try:
+            smc_dir = int(float(smc_dir)) if smc_dir is not None else None
+        except (TypeError, ValueError):
+            smc_dir = None
+        try:
+            smc_age = int(float(smc_age)) if smc_age is not None else None
+        except (TypeError, ValueError):
+            smc_age = None
+
+        expected_dir = 1 if signal == 'BUY CE' else -1 if signal == 'BUY PE' else None
+        dir_ok = expected_dir is not None and smc_dir == expected_dir
+        fresh_ok = smc_age is not None and 0 <= smc_age <= SMC_MAX_ZONE_AGE
+
+        if dir_ok and fresh_ok:
+            return True, ""
+
+        smc_dir_label = {1: 'Bullish OB retest', -1: 'Bearish OB retest', 0: 'None yet', None: 'N/A'}.get(smc_dir, 'N/A')
+        age_label = str(smc_age) if smc_age is not None else "N/A"
+        return False, (f"Smart Money Concepts gate failed (last order-block retest: {smc_dir_label}, "
+                        f"{age_label} bars ago, needs <= {SMC_MAX_ZONE_AGE}). "
+                        f"No recent, direction-agreeing order-block retest.")
 
     def _try_contrarian_flip(sym, original_signal, t1, spot_price):
         """[ADDED -- ENABLE_PCR_CONTRARIAN_FLIP, Harish's idea, 16-Jul-26]
@@ -1335,6 +1380,14 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     sr_ok, sr_detail = _sr_gate_check(sym, s1, t1)
                     if not sr_ok:
                         reason = f"{opt_symbol}: {sr_detail}"
+                        print(f"[REJECTED] {sym} -> {reason}")
+                        _log_rejection(sym, t1, s1, reason)
+                        current_signal_streak = None
+                        continue
+
+                    smc_ok, smc_detail = _smc_gate_check(sym, s1, t1)
+                    if not smc_ok:
+                        reason = f"{opt_symbol}: {smc_detail}"
                         print(f"[REJECTED] {sym} -> {reason}")
                         _log_rejection(sym, t1, s1, reason)
                         current_signal_streak = None

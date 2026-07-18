@@ -55,6 +55,13 @@ try:
     # Pine Script was already sitting in 04_ProjectFiles; this module was
     # newly built, no interface issue to fix (unlike SuperTrend AI above).
     import support_resistance
+    # [ADDED -- 18-Jul-26, Task 51] Smart Money Concepts (order blocks +
+    # retest) -- see smart_money_concepts.py's docstring. First version
+    # of the ICT/SMC bucket flagged in the training-material review;
+    # deliberately scoped to order blocks only, not the full pattern
+    # catalog (liquidity sweeps/FVG/CHoCH/breaker blocks are dormant in
+    # smc_lib.py for a future pass).
+    import smart_money_concepts
 except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import pipeline modules: {e}")
     print("Ensure all scripts are saved in the '05 Codes' directory with correct filenames.")
@@ -109,6 +116,12 @@ INDICATORS = [
     # different dimension from TREND/MOMENTUM/VOLUME); consumed as an
     # off-by-default pre-entry GATE in order_sheet.py (ENABLE_SR_GATE).
     ("Support/Resistance",     support_resistance,   "SUPRES"),
+    # [ADDED -- 18-Jul-26, Task 51] Smart Money Concepts order blocks --
+    # see smart_money_concepts.py's docstring. NOT a final_sheet.py vote
+    # (structural/order-flow signal, a different dimension again);
+    # consumed as an off-by-default pre-entry GATE in order_sheet.py
+    # (ENABLE_SMC_GATE).
+    ("Smart Money Concepts",   smart_money_concepts, "SMC"),
 ]
 
 
