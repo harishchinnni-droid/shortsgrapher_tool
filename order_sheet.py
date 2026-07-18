@@ -157,6 +157,10 @@ DAILY_DRAWDOWN_CACHE = os.path.join(JSON_DIR, "daily_drawdown_cache.json")
 VIX_MAX = 18.0
 MIN_ENTRY_LTP = 6.0
 ADX_MIN = 18.0
+# [CHANGED -- 18-Jul-26, Harish] Disabled: he wants signals to reach the
+# order sheet and be managed via SL/TSL instead of pre-filtered out here.
+# Flag kept (not deleted) so this can be re-enabled and A/B'd later.
+ENABLE_ADX_GATE = False
 DEFAULT_STRIKE_STEP = 50
 MAX_POSITIONS_PER_SECTOR = 2
 
@@ -188,7 +192,11 @@ LOW_LIQUIDITY_WINDOW_END = dtime(13, 0)
 # 38 trades, Net P/L -Rs 4,719.77, 44.7% win rate (see task 41 notes).
 # Flip back to False after this A/B once the ON-range results are in and
 # compared, unless the delta clearly favors leaving it on.
-ENABLE_ZEROLAG_GATE = True
+#
+# [CHANGED -- 18-Jul-26, Harish] Disabled after reviewing a clean post-fix
+# 01-15 Jul run: he wants signals to reach the order sheet and be managed
+# via SL/TSL rather than pre-filtered out by this gate. Revisit later.
+ENABLE_ZEROLAG_GATE = False
 ZEROLAG_RVOL_MIN = zerolag.RVOL_MIN  # 0.8 as of 18-Jul-26 recalibration -- see zerolag.py
 
 # [ADDED -- 18-Jul-26, Task 41 Q1] The chart's own 'X' cross marker for
@@ -271,7 +279,10 @@ PCR_TREND_MIN_READINGS = 3
 # so this mostly delays a symbol's FIRST possible entry each session
 # rather than removing it outright. Set False to restore the old
 # gate-skipped behavior for an A/B re-run.
-PCR_REQUIRE_SUFFICIENT_DATA = True
+#
+# [CHANGED -- 18-Jul-26, Harish] Disabled: he wants signals to reach the
+# order sheet and be managed via SL/TSL instead of pre-filtered out here.
+PCR_REQUIRE_SUFFICIENT_DATA = False
 
 # [ADDED -- risk_and_signal_patches audit, 13-Jul-26] The 06-13 Jul 26
 # sample showed 65% of executed trades (32/49) carried PCR Trend =
@@ -1354,7 +1365,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         pre_entry_adx = float(pre_entry_adx) if pre_entry_adx is not None else None
                     except (TypeError, ValueError):
                         pre_entry_adx = None
-                    if pre_entry_adx is not None and pre_entry_adx < ADX_MIN:
+                    if ENABLE_ADX_GATE and pre_entry_adx is not None and pre_entry_adx < ADX_MIN:
                         reason = f"{opt_symbol}: Low momentum / choppy regime (ADX {pre_entry_adx:.1f} < {ADX_MIN}). Skipping."
                         print(f"[REJECTED] {sym} -> {reason}")
                         _log_rejection(sym, t1, s1, reason)
