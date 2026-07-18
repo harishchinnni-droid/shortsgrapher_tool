@@ -356,8 +356,15 @@ def get_vix_snapshot(kite_api, target_date, time_str, kite_master, cache, interv
 # returns one point-in-time reading; see order_sheet.py for how a
 # sequence of these gets turned into a trend-based gate.
 # ---------------------------------------------------------------------------
-def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, kite_master,
-                        kite_api, cache, strikes_each_side=5, strike_step_default=50):
+def resolve_pcr_chain_tokens(base_symbol, spot_price, df_ref, kite_master,
+                              strikes_each_side=5, strike_step_default=50):
+    """[ADDED -- Task 60, concurrent prefetch] Returns [(instrument_token,
+    tradingsymbol), ...] for the ATM +/- N strike chain get_historical_pcr
+    uses -- WITHOUT fetching any candle data. Pulled out of
+    get_historical_pcr() itself so both that function and the concurrent
+    prefetch pass in order_sheet.py resolve the exact same chain from the
+    exact same logic; they can never drift out of sync since one calls
+    the other."""
     diff_val = strike_step_default
     match = df_ref[df_ref['Symbol / StrikePrice'].astype(str).str.strip().str.upper() == base_symbol]
     if not match.empty and 'Option Price Difference' in df_ref.columns:
@@ -366,7 +373,7 @@ def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, k
             diff_val = val
 
     if not spot_price:
-        return None
+        return []
 
     atm_strike = round(spot_price / diff_val) * diff_val
     strikes = [atm_strike + i * diff_val for i in range(-strikes_each_side, strikes_each_side + 1)]
@@ -376,17 +383,29 @@ def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, k
         & (kite_master['strike'].isin(strikes))
     ]
     if chain.empty:
-        return None
+        return []
 
     current_expiry = chain.sort_values('expiry').iloc[0]['expiry']
     chain = chain[chain['expiry'] == current_expiry]
+    return list(zip(chain['instrument_token'].tolist(), chain['tradingsymbol'].tolist()))
+
+
+def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, kite_master,
+                        kite_api, cache, strikes_each_side=5, strike_step_default=50):
+    if not spot_price:
+        return None
+
+    chain_tokens = resolve_pcr_chain_tokens(base_symbol, spot_price, df_ref, kite_master,
+                                             strikes_each_side, strike_step_default)
+    if not chain_tokens:
+        return None
 
     put_oi, call_oi = 0.0, 0.0
-    for _, row in chain.iterrows():
-        snap = get_option_snapshot(kite_api, row['instrument_token'], target_date, time_str, cache)
+    for token, tsym in chain_tokens:
+        snap = get_option_snapshot(kite_api, token, target_date, time_str, cache)
         if snap is None:
             continue
-        tsym = str(row['tradingsymbol'])
+        tsym = str(tsym)
         if tsym.endswith('PE'):
             put_oi += snap['oi']
         elif tsym.endswith('CE'):

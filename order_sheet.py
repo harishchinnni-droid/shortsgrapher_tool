@@ -116,6 +116,7 @@ import os
 import sys
 import json
 import time
+import concurrent.futures  # [ADDED -- Task 60] concurrent historical-data prefetch, see _prefetch_option_history()
 from datetime import datetime
 from datetime import time as dtime  # [ADDED -- Task 49] time-of-day constants; 'time' above is the stdlib module
 
@@ -298,6 +299,34 @@ PCR_REQUIRE_SUFFICIENT_DATA = False
 # LIVE. Consider disabling in LIVE if Kite rate limits become an issue;
 # the persistence fix (PCR_TREND_CACHE, already applied) still helps on
 # its own across cycles even with this off.
+
+# [ADDED -- Task 60, 18-Jul-26, Harish's speed request] BACKTEST-only.
+# Harish reported the audit/rejection stage running slowly. Root cause
+# (traced, not guessed): ENABLE_EAGER_PCR_RECORDING above already fires
+# an 11-strike historical option lookup on every single BUY CE/PE bar,
+# and every symbol was being processed fully sequentially further down
+# in build_order_sheet() even though data_ingestion.RateLimiter was
+# already built thread-safe for concurrent workers ("scales cleanly with
+# worker count" -- see its own docstring) and just wasn't being used that
+# way. This flag turns on a one-time CONCURRENT prefetch pass
+# (_prefetch_option_history()) that fires every option/VIX history
+# request this run will need through a small thread pool, sharing the
+# exact same rate limiter (so the real 3 req/sec Kite ceiling is never
+# exceeded -- concurrency here means no idle gaps between calls, not a
+# higher call rate), before the existing SEQUENTIAL trade-logic loop
+# below runs at all. That loop is completely unmodified and untouched by
+# this flag -- it still runs in the same order, with the same sector-cap/
+# position-tracking state, producing byte-for-byte identical
+# orders/rejections; the only thing that changes is that its historical
+# lookups are now cache hits instead of fresh rate-limited network calls.
+# A contract that fails to prefetch (rare) simply gets fetched normally,
+# the old way, when the sequential loop actually reaches it -- this is a
+# pure speed optimization, never a hard dependency. Re-runs of a date
+# already touched by a prior run pay almost nothing here either way,
+# since historical_lookup's on-disk cache is already permanent per
+# (contract, date).
+ENABLE_CONCURRENT_PREFETCH = True
+PREFETCH_MAX_WORKERS = 8
 ENABLE_EAGER_PCR_RECORDING = True
 
 # [REVERTED -- 16-Jul-26, second audit] Was briefly set to informational-
@@ -721,6 +750,75 @@ def get_oi_buildup_signal(opt_symbol, current_oi, current_price, signal, cache_p
 
 
 # ---------------------------------------------------------------------------
+# [ADDED -- Task 60] Concurrent BACKTEST option-history prefetch. Pure
+# speed optimization -- see ENABLE_CONCURRENT_PREFETCH's docstring above
+# for the full rationale. Touches ONLY hist_cache's internal dicts
+# (populating them ahead of time); never writes existing_orders, never
+# logs a rejection, never evaluates a gate. The sequential loop in
+# build_order_sheet() below is completely unaware this ran -- it just
+# finds its usual lookups already warm.
+# ---------------------------------------------------------------------------
+def _prefetch_option_history(kite_api, target_date, df_ref, kite_master, final_table, hist_cache,
+                              max_workers=PREFETCH_MAX_WORKERS):
+    """Resolves every option contract (PCR chain + traded contract) that
+    ANY bar reading BUY CE/PE across the whole day's final_table could
+    touch, then fetches them all concurrently through hist_cache's own
+    thread-safe rate limiter. Reuses historical_lookup.resolve_pcr_chain_tokens()
+    (the exact same chain-resolution logic get_historical_pcr() itself
+    calls) and this module's own resolve_option_chain(), so the set of
+    contracts prefetched here can never drift out of sync with what the
+    real sequential pass actually needs."""
+    needed_tokens = set()
+
+    for sym, time_map in final_table.items():
+        if _match_symbol(df_ref, sym) is None:
+            continue
+        for t, signal in time_map.items():
+            if signal not in ("BUY CE", "BUY PE"):
+                continue
+            try:
+                spot_price = historical_lookup.get_spot_snapshot(sym, target_date, t) or 0
+                if not spot_price:
+                    continue
+                for token, _tsym in historical_lookup.resolve_pcr_chain_tokens(sym, spot_price, df_ref, kite_master):
+                    needed_tokens.add(int(token))
+                _opt_symbol, opt_token, _lot, _atm = resolve_option_chain(sym, spot_price, signal, df_ref, kite_master)
+                if opt_token:
+                    needed_tokens.add(int(opt_token))
+            except Exception as e:
+                # Best-effort only -- a symbol/bar this fails for just
+                # won't be pre-warmed; the sequential loop below will
+                # still resolve it normally (fresh fetch) when it gets there.
+                print(f"[WARNING] Prefetch: couldn't resolve tokens for {sym} at {t}: {e}")
+
+    if not needed_tokens:
+        return
+
+    print(f"[SYSTEM] Prefetching historical data for {len(needed_tokens)} option contract(s) + India VIX "
+          f"({max_workers} concurrent workers, same shared rate limiter -- Kite's request rate is unchanged)...")
+
+    def _fetch_one_option(token):
+        try:
+            historical_lookup.fetch_option_day_candles(kite_api, token, target_date, hist_cache)
+        except Exception as e:
+            print(f"[WARNING] Prefetch failed for option token {token}: {e} -- will retry normally when reached.")
+
+    def _fetch_vix():
+        try:
+            historical_lookup.get_vix_snapshot(kite_api, target_date, "15:25", kite_master, hist_cache)
+        except Exception as e:
+            print(f"[WARNING] VIX prefetch failed: {e} -- will retry normally when reached.")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_one_option, token) for token in needed_tokens]
+        futures.append(executor.submit(_fetch_vix))
+        for f in concurrent.futures.as_completed(futures):
+            f.result()  # exceptions are already caught+logged inside each worker; this just drains them
+
+    print(f"[SUCCESS] Prefetch complete -- {len(hist_cache.option_candles)} option contract-day(s) now cached in memory.")
+
+
+# ---------------------------------------------------------------------------
 # Core: 3-column streak detection -> order creation / 5M-reversal exit
 # ---------------------------------------------------------------------------
 def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LIVE, target_date=None,
@@ -765,6 +863,18 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # the actual cause of PCR Trend showing INSUFFICIENT_DATA constantly.
     pcr_tracker = PCRTrendTracker(cache_path=None if is_backtest else PCR_TREND_CACHE)
     hist_cache = historical_lookup.HistoricalCache(kite_api) if is_backtest else None
+
+    # [ADDED -- Task 60] Warm hist_cache concurrently BEFORE the
+    # sequential trade-logic loop below runs -- see
+    # ENABLE_CONCURRENT_PREFETCH's docstring above. LIVE mode uses
+    # kite_api.quote() instead (a different, already-cheap live-quote
+    # path), so this only applies to BACKTEST.
+    if is_backtest and ENABLE_CONCURRENT_PREFETCH:
+        try:
+            _prefetch_option_history(kite_api, target_date, df_ref, kite_master, final_table, hist_cache)
+        except Exception as e:
+            print(f"[WARNING] Concurrent prefetch pass failed ({e}) -- continuing without it; "
+                  f"the sequential loop below will fetch everything the normal way instead.")
 
     # [ADDED -- risk_and_signal_patches audit] Daily drawdown circuit
     # breaker. LIVE: persists across cycles via DAILY_DRAWDOWN_CACHE, so
