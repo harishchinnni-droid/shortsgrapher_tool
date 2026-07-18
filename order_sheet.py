@@ -263,6 +263,13 @@ ORDER_HEADERS = [
     'ATR (Underlying)', 'Entry LTP', 'Stop Loss LTP', 'Target LTP', 'Risk/Unit (Rs)',
     'Quantity (Lots)', 'Quantity (Units)', 'Risk Amount (Rs)',
     'Current LTP', 'Max LTP', 'Min LTP',
+    # [ADDED -- ENABLE_TSL_CONFIRMATION_HOLD] Persists position_manager.
+    # check_live_exit()'s confirmation counter across LIVE polling cycles
+    # for this position -- see that function's docstring. Always "" (read
+    # back as 0) when the flag is off; BACKTEST doesn't need this column
+    # at all since simulate_backtest_exit() tracks its own streak
+    # internally within one call.
+    'TSL Breach Streak',
     'Gross P/L (Rs)', 'Costs (Rs)', 'Net P/L (Rs)',
     'Order ID', 'Exit Time', 'Exit Reason',
 ]
@@ -1502,6 +1509,7 @@ def update_open_positions_live(kite_api, output_excel_path):
         risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
         max_ltp_seen = float(order.get('Max LTP') or entry_ltp)
         min_ltp_seen = float(order.get('Min LTP') or entry_ltp)
+        tsl_breach_streak = int(order.get('TSL Breach Streak') or 0)  # [ADDED] see position_manager.check_live_exit()
         quantity = int(order.get('Quantity (Units)') or 0)  # [MOVED] up so it can be passed in below
         pre_entry_time = order.get('Pre-Entry Trigger Time')
         try:
@@ -1512,14 +1520,16 @@ def update_open_positions_live(kite_api, output_excel_path):
         except Exception:
             entry_dt = now
 
-        should_exit, exit_reason, exit_ltp, new_max, new_trailing_stop = position_manager.check_live_exit(
+        should_exit, exit_reason, exit_ltp, new_max, new_trailing_stop, new_tsl_streak = position_manager.check_live_exit(
             entry_ltp, stop_ltp, target_ltp, risk_per_unit, current_ltp, max_ltp_seen, entry_dt, now,
             quantity=quantity,  # [ADDED] enables the Rs 2,000 hard-cap check
+            tsl_breach_streak=tsl_breach_streak,  # [ADDED] ENABLE_TSL_CONFIRMATION_HOLD -- carried across polls
         )
 
         df_orders.at[idx, 'Current LTP'] = current_ltp
         df_orders.at[idx, 'Max LTP'] = max(new_max, max_ltp_seen)
         df_orders.at[idx, 'Min LTP'] = min(min_ltp_seen, current_ltp)
+        df_orders.at[idx, 'TSL Breach Streak'] = new_tsl_streak
         changed = True
 
         if should_exit:

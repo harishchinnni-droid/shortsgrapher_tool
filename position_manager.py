@@ -102,6 +102,35 @@ MAX_STOP_PCT = 0.35                  # ceiling: stop no wider than 35% of premiu
 REWARD_MULTIPLE = 2.0                # target = entry + 2R (research: 1:2 to 1:3 is typical)
 TRAIL_TRIGGER_R = 1.0                # once +1R in profit, start trailing
 TRAIL_LOCK_FRACTION = 0.5            # lock in 50% of the running gain above entry
+
+# [ADDED -- 17-Jul-26, Harish's request] TRAIL_LOCK_FRACTION above locks
+# in 50% of the running gain the INSTANT price touches that level -- a
+# single wick/pullback candle is enough to close a trade that's still
+# winning (HINDALCO, 17-Jul-26: exited 'Trailing Stop Hit' at 13:40 with
+# the underlying then continuing favorably before recovering -- real
+# money left on the table, see the 17-Jul-26 audit). This is the
+# "time-delayed / N-bar confirmation" technique from trailing-stop
+# research (require the adverse price to persist for a few bars before
+# honoring the stop, instead of reacting to the very first touch) --
+# sources: TrendSpider's ATR trailing-stop guide and the Volatility Box
+# ATR/Chandelier/Keltner comparison both describe this as standard
+# practice for filtering normal pullback noise from a genuine reversal.
+#
+# Applied ONLY to the TRAILING portion (trailing_stop > stop_ltp -- the
+# trade already ran +1R and is giving some back) -- the original hard ATR
+# stop_ltp and the MAX_LOSS_PER_TRADE_RS cap stay INSTANT either way.
+# Those two exist to protect capital on a trade that's LOSING; delaying
+# them to "hold with reason" would be a real risk-management regression,
+# not an improvement -- only a trade already sitting on unrealized profit
+# gets the extra patience.
+#
+# Off by default -- needs its own A/B backtest (same pattern as every
+# other experimental flag in this codebase) before being trusted. There's
+# evidence it would have helped THIS one trade, not proof it helps on
+# average -- more patience also means more given-back profit on trades
+# that really were reversing for good.
+ENABLE_TSL_CONFIRMATION_HOLD = False
+TSL_CONFIRMATION_BARS = 2            # consecutive candles/cycles closed at/below the trail before honoring it
 MAX_HOLD_MINUTES = 75                # theta-decay cap -- exit on time even absent SL/target
 EOD_SQUAREOFF_TIME = "15:15"         # hard square-off
 
@@ -331,6 +360,7 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
     max_ltp_seen = entry_ltp
     min_ltp_seen = entry_ltp
     trailing_stop = stop_ltp
+    tsl_breach_streak = 0  # [ADDED -- ENABLE_TSL_CONFIRMATION_HOLD] consecutive confirmed-breach candles
 
     reversal_dt = (historical_lookup.time_str_to_dt(target_date, signal_reversal_time_str)
                    if signal_reversal_time_str else None)
@@ -378,12 +408,32 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
         # range spans BOTH the stop and the target, assume the stop hit
         # first -- OHLC alone can't tell true intra-candle sequencing,
         # and assuming the worse outcome is the standard conservative
-        # backtest convention.
+        # backtest convention. [CHANGED -- ENABLE_TSL_CONFIRMATION_HOLD]
+        # The original hard ATR stop (trailing_stop == stop_ltp, no profit
+        # cushion yet) still exits INSTANTLY off candle_low exactly as
+        # before -- only a TRAILING breach (already in profit) can be held
+        # for confirmation, and only using candle CLOSE (a wick touching
+        # the level doesn't count -- see flag docstring above).
+        is_trailing = trailing_stop > stop_ltp
         if candle_low <= trailing_stop:
-            reason = 'Trailing Stop Hit' if trailing_stop > stop_ltp else 'Stop Loss Hit'
-            return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(trailing_stop, 2),
-                    'exit_reason': reason, 'max_ltp_seen': round(max_ltp_seen, 2),
-                    'min_ltp_seen': round(min_ltp_seen, 2)}
+            if not (ENABLE_TSL_CONFIRMATION_HOLD and is_trailing):
+                reason = 'Trailing Stop Hit' if is_trailing else 'Stop Loss Hit'
+                return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(trailing_stop, 2),
+                        'exit_reason': reason, 'max_ltp_seen': round(max_ltp_seen, 2),
+                        'min_ltp_seen': round(min_ltp_seen, 2)}
+            if candle_close <= trailing_stop:
+                tsl_breach_streak += 1
+                if tsl_breach_streak >= TSL_CONFIRMATION_BARS:
+                    return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(candle_close, 2),
+                            'exit_reason': f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars)',
+                            'max_ltp_seen': round(max_ltp_seen, 2), 'min_ltp_seen': round(min_ltp_seen, 2)}
+                # Held with reason: low wicked through but didn't close
+                # beyond the trail confirmed yet -- fall through to the
+                # other exit checks below instead of returning.
+            else:
+                tsl_breach_streak = 0
+        else:
+            tsl_breach_streak = 0
         if candle_high >= target_ltp:
             return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(target_ltp, 2),
                     'exit_reason': 'Target Hit', 'max_ltp_seen': round(max_ltp_seen, 2),
@@ -432,14 +482,23 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
 def check_live_exit(entry_ltp, stop_ltp, target_ltp, risk_per_unit_premium, current_ltp,
                      max_ltp_seen, entry_dt, now_dt, signal_reversal_now=False,
                      max_hold_minutes=MAX_HOLD_MINUTES, eod_squareoff_time=EOD_SQUAREOFF_TIME,
-                     quantity=0, max_loss_rs=MAX_LOSS_PER_TRADE_RS):
+                     quantity=0, max_loss_rs=MAX_LOSS_PER_TRADE_RS, tsl_breach_streak=0):
     """Pure decision function (no I/O) so it can be unit-tested the same
     way simulate_backtest_exit() is. Returns (should_exit, exit_reason,
-    exit_ltp, new_max_ltp_seen, new_trailing_stop) for ONE live poll.
+    exit_ltp, new_max_ltp_seen, new_trailing_stop, new_tsl_breach_streak)
+    for ONE live poll.
 
     [ADDED] quantity: pass the order's Quantity (Units) to enable the hard
     rupee cap below -- pass 0 (default) to skip it. See
-    MAX_LOSS_PER_TRADE_RS docstring."""
+    MAX_LOSS_PER_TRADE_RS docstring.
+
+    [ADDED] tsl_breach_streak: pass back in whatever new_tsl_breach_streak
+    this function returned on the PREVIOUS poll for this same open
+    position (order_sheet.py persists it in the 'TSL Breach Streak'
+    column) -- LIVE has no candle history to look back over the way
+    simulate_backtest_exit() does, so the confirmation count has to be
+    carried across cycles by the caller instead. See
+    ENABLE_TSL_CONFIRMATION_HOLD's docstring above."""
     new_max = max(max_ltp_seen, current_ltp)
     trailing_stop = stop_ltp
     gain = new_max - entry_ltp
@@ -467,24 +526,40 @@ def check_live_exit(entry_ltp, stop_ltp, target_ltp, risk_per_unit_premium, curr
             effective_cap = max_loss_rs
         unrealized_loss = (entry_ltp - current_ltp) * quantity
         if unrealized_loss > effective_cap:
-            return True, f'Hard Stop-Loss (Rs {max_loss_rs:.0f} cap)', current_ltp, new_max, trailing_stop
+            return True, f'Hard Stop-Loss (Rs {max_loss_rs:.0f} cap)', current_ltp, new_max, trailing_stop, tsl_breach_streak
 
+    # [CHANGED -- ENABLE_TSL_CONFIRMATION_HOLD, mirrors
+    # simulate_backtest_exit()'s same change] Only a TRAILING breach
+    # (already in profit) can be held for confirmation across polls; the
+    # original hard stop_ltp still exits instantly.
+    is_trailing = trailing_stop > stop_ltp
+    new_streak = tsl_breach_streak
     if current_ltp <= trailing_stop:
-        reason = 'Trailing Stop Hit' if trailing_stop > stop_ltp else 'Stop Loss Hit'
-        return True, reason, trailing_stop, new_max, trailing_stop
+        if not (ENABLE_TSL_CONFIRMATION_HOLD and is_trailing):
+            reason = 'Trailing Stop Hit' if is_trailing else 'Stop Loss Hit'
+            return True, reason, trailing_stop, new_max, trailing_stop, new_streak
+        new_streak = tsl_breach_streak + 1
+        if new_streak >= TSL_CONFIRMATION_BARS:
+            return (True, f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars)',
+                    current_ltp, new_max, trailing_stop, new_streak)
+        # Held with reason -- fall through to the other checks below
+        # instead of exiting on this poll.
+    else:
+        new_streak = 0
+
     if current_ltp >= target_ltp:
-        return True, 'Target Hit', target_ltp, new_max, trailing_stop
+        return True, 'Target Hit', target_ltp, new_max, trailing_stop, new_streak
     if ENABLE_SIGNAL_REVERSAL_EXIT and signal_reversal_now:
-        return True, '5M Reversal (Signal WAIT)', current_ltp, new_max, trailing_stop
+        return True, '5M Reversal (Signal WAIT)', current_ltp, new_max, trailing_stop, new_streak
     if ENABLE_NO_FOLLOWTHROUGH_EXIT and _no_followthrough_triggered(
             entry_dt, now_dt, new_max, entry_ltp, risk_per_unit_premium):
         return (True, f'No Follow-Through ({NO_FOLLOWTHROUGH_MINUTES}min, <{NO_FOLLOWTHROUGH_R_MULTIPLE}R)',
-                current_ltp, new_max, trailing_stop)
+                current_ltp, new_max, trailing_stop, new_streak)
     if now_dt >= entry_dt + timedelta(minutes=max_hold_minutes):
-        return True, f'Max Hold Time ({max_hold_minutes}min)', current_ltp, new_max, trailing_stop
+        return True, f'Max Hold Time ({max_hold_minutes}min)', current_ltp, new_max, trailing_stop, new_streak
     if now_dt >= eod_dt:
-        return True, 'EOD Square-off', current_ltp, new_max, trailing_stop
-    return False, None, current_ltp, new_max, trailing_stop
+        return True, 'EOD Square-off', current_ltp, new_max, trailing_stop, new_streak
+    return False, None, current_ltp, new_max, trailing_stop, new_streak
 
 
 # ---------------------------------------------------------------------------
