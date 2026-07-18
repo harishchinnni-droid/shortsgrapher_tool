@@ -37,15 +37,21 @@ Integration -- a GATE, not a vote:
     See order_sheet.py's ENABLE_ZEROLAG_GATE flag -- off by default,
     same A/B pattern as every other experimental gate in this codebase.
 
-Known limitation (same one breakout_probability.py already documents):
-    load_interval_data() only loads ONE trading day's 5-minute candles per
-    symbol (~75 bars, 09:15-15:15), not a multi-day rolling window. The
-    Zero-Lag EMA's default 34-length and the ATR's 14-length warm-up eats
-    into a meaningful chunk of that (~16-34 bars) before either stabilizes
-    -- expect 'Trend Dir'/'RVOL' to be WAIT/blank for roughly the first
-    30-45 minutes of every session. This is the same constraint every
-    other indicator in this pipeline already lives with, not something
-    new introduced here.
+[CORRECTED -- 17-Jul-26 audit] This docstring originally claimed
+load_interval_data() only hands process_symbol() a single trading day\'s
+~75 bars, meaning the 34-bar ZLEMA/14-bar ATR warm-up would leave
+\'Trend Dir\' at WAIT for the first 30-45 minutes of every session. That
+was wrong -- verified against the deployed \'ZLTREND\' sheet and a from-
+scratch recompute against the real historical CSVs (see the 17-Jul-26
+SBILIFE/HINDALCO audit): download_historical_data() backfills a rolling
+~90-day window into the SAME per-date CSV file load_interval_data() reads
+(data_ingestion.py, `from_date = target_date - timedelta(days=90)`), and
+restrict_to_target_date() only truncates the OUTPUT rows to target_date
+AFTER calculate_zerolag() has already run across that full history. In
+practice there\'s no meaningful warm-up gap -- both ZLEMA and ATR are
+long since stable by the start of any single trading day. (This matches
+breakout_probability.py\'s own docstring, which already correctly
+described the ~90-day window -- only this file\'s claim was stale.)
 
 Timeframe: 5-minute candles, truncated per day to CUTOFF_TIME (15:15),
 same as every other module in this pipeline.
