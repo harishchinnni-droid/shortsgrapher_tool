@@ -357,7 +357,7 @@ def compute_supertrend_recomm(os_vals, ts_vals):
 # Per-symbol processing (same brute-force time/timezone protocol as RSI.py)
 # ---------------------------------------------------------------------------
 def process_symbol(symbol_data):
-    symbol, df = symbol_data
+    symbol, df, target_date = symbol_data
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip().str.lower()
 
@@ -398,6 +398,23 @@ def process_symbol(symbol_data):
         return symbol, None
 
     df = calculate_supertrend_ai(df)
+
+    # [ADDED -- 18-Jul-26, Task 48] This module predates the codebase-wide
+    # target_date interface change (see run_pipeline.py's own comment on
+    # this) and never truncated its output to the target date -- every
+    # OTHER indicator restricts its matrix to target_date's own bars
+    # right here (same call, same spot) so the sheet ends up with one
+    # day's worth of time columns, not the full ~90-day backfill window
+    # every symbol's CSV actually contains. Without this, wiring this
+    # module in would have produced a sheet with months of columns
+    # instead of one trading day's ~75. This is very likely WHY it was
+    # never actually wired into run_pipeline.py despite being fully
+    # written -- confirmed via git history: it's untouched since the
+    # initial commit, not a deliberate later removal.
+    df = excel_utils.restrict_to_target_date(df, target_date)
+    if df is None:
+        return symbol, None
+
     return symbol, df
 
 
@@ -406,13 +423,21 @@ def process_symbol(symbol_data):
 # workbook (same pattern as RSI.py / SQZMOM.py: load_workbook, replace only
 # the 'Supertrend' sheet, leave every other sheet untouched).
 # ---------------------------------------------------------------------------
-def build_matrix(data_dict, max_workers=None):
+def build_matrix(data_dict, target_date, max_workers=None):
     """Executes multi-core calculation and builds the pivoted Matrix
     (no Excel I/O -- safe to run concurrently with other indicators'
-    build_matrix() calls since it never touches the shared workbook)."""
+    build_matrix() calls since it never touches the shared workbook).
+
+    [CHANGED -- Task 48] Added target_date, matching the signature every
+    other indicator module's build_matrix() already uses (run_pipeline.py
+    calls all of them identically: module.build_matrix(data_dict,
+    target_date, max_workers=...)). This module's build_matrix() didn't
+    accept it before, which is exactly what made adding this to
+    run_pipeline.py's INDICATORS list an immediate TypeError -- not a
+    deliberate exclusion."""
     results = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_symbol, (sym, df)): sym for sym, df in data_dict.items()}
+        futures = {executor.submit(process_symbol, (sym, df, target_date)): sym for sym, df in data_dict.items()}
         for future in concurrent.futures.as_completed(futures):
             sym = futures[future]
             try:
@@ -510,9 +535,9 @@ def write_matrix(matrix_rows, output_excel_path):
 
 
 
-def parallel_compute_and_export(data_dict, output_excel_path, max_workers=None):
+def parallel_compute_and_export(data_dict, target_date, output_excel_path, max_workers=None):
     """Backward-compatible fused entry point (build + write in one call)."""
-    matrix_rows = build_matrix(data_dict, max_workers=max_workers)
+    matrix_rows = build_matrix(data_dict, target_date, max_workers=max_workers)
     write_matrix(matrix_rows, output_excel_path)
 
 
@@ -523,7 +548,7 @@ def run_supertrend_step(df_ref, target_date, output_excel_path):
     if not data_dict:
         raise RuntimeError("Supertrend: no 5-minute data files found for any symbol.")
     print(f"[PROCESS] Computing SuperTrend AI matrix for {len(data_dict)} symbol(s)...")
-    parallel_compute_and_export(data_dict, output_excel_path)
+    parallel_compute_and_export(data_dict, target_date, output_excel_path)
     print("[SUCCESS] SuperTrend AI matrix written to sheet 'Supertrend'.")
 
 

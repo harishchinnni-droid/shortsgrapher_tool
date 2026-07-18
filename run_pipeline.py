@@ -44,6 +44,12 @@ try:
     import vwap
     import obv_cmf
     import zerolag
+    # [ADDED -- 18-Jul-26, Task 48] Fully written (LuxAlgo SuperTrend AI
+    # translation, see supertrend_ai.py) but never actually wired in --
+    # its build_matrix() predated this codebase's target_date interface
+    # change and would have crashed immediately if added here as-is. Now
+    # fixed and added below, same as every other trend indicator.
+    import supertrend_ai
 except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import pipeline modules: {e}")
     print("Ensure all scripts are saved in the '05 Codes' directory with correct filenames.")
@@ -83,6 +89,15 @@ INDICATORS = [
     # instead (ENABLE_ZEROLAG_GATE). Still listed here so its own sheet
     # gets computed/written like every other indicator.
     ("Zero-Lag Trend",         zerolag,              "ZLTREND"),
+    # [ADDED -- 18-Jul-26, Task 48] LuxAlgo SuperTrend AI (Clustering) --
+    # see supertrend_ai.py's docstring. Same treatment as Zero-Lag: NOT a
+    # final_sheet.py vote (TREND category already has its 3 -- EMA20/
+    # VWAP/TW ALL -- adding a 4th changes the "≥2/3" math and risks
+    # "one trend opinion asked three times" again); consumed instead as
+    # an off-by-default pre-entry GATE in order_sheet.py
+    # (ENABLE_SUPERTREND_GATE) so it can be A/B tested on its own,
+    # independent of the still-pending Zero-Lag/PCR re-test.
+    ("SuperTrend AI",          supertrend_ai,        "Supertrend"),
 ]
 
 
