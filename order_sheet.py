@@ -1214,6 +1214,80 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         }
         return fields, flipped_signal
 
+    def _resolve_backtest_exit_now(key):
+        """[ADDED -- Task 64, 20-Jul-26, Harish's LIVE-vs-BACKTEST audit]
+        Resolves ONE just-created BACKTEST order's real exit IMMEDIATELY,
+        instead of waiting for every symbol's entire day to be scanned
+        first the way this used to work (see the old two-phase design:
+        Phase 1 detected every entry for the whole day, Phase 2 only
+        THEN walked forward to find each trade's real exit).
+
+        That gap was a genuine bug, not a stylistic choice: with every
+        order's 'Exit Time' staying blank until Phase 2, has_open_
+        position_in_symbol() could never see a position as closed until
+        the WHOLE day's entries were already decided -- so once a symbol
+        took one trade, EVERY later signal in that same symbol got
+        rejected as 'position already open' for the rest of the day, no
+        matter how quickly the real trade would have exited. Proven
+        directly against Harish's 20-Jul-26 LIVE vs BACKTEST comparison:
+        BACKTEST's confirmed indicator signals were byte-identical to
+        LIVE's, yet BACKTEST took 6 trades total (structurally ~1/symbol/
+        day) against LIVE's 36 (which freely re-entered HEROMOTOCO,
+        JSWSTEEL, AXISBANK etc. after each real exit) -- e.g. BACKTEST's
+        one HEROMOTOCO trade closed at 09:50, but later HEROMOTOCO
+        signals at 10:00/10:35/13:45/14:40/15:05 were all still rejected
+        as 'already open' hours after it had actually closed.
+
+        Resolving the exit right here, before the per-symbol scan moves
+        on to check for more signals in THIS SAME symbol, fixes that
+        completely -- has_open_position_in_symbol() now sees the real
+        Exit Time the moment it exists, exactly like LIVE does (LIVE
+        gets this for free by being re-invoked every 5-minute cycle
+        against the real, just-updated Orders sheet on disk).
+
+        signal_reversal_time_str is passed as None here because the
+        reversal bar (if any) for THIS streak hasn't been scanned yet at
+        this point in this same symbol's walk -- it's a later bar by
+        definition. Harmless today: position_manager.ENABLE_SIGNAL_
+        REVERSAL_EXIT is False, and simulate_backtest_exit() only ever
+        reads signal_reversal_time_str when that flag is True (see its
+        own gate). If that flag is ever turned on, this immediate-
+        resolution path will need a follow-up (re-simulating a trade
+        once a same-day reversal is detected on a later bar), since that
+        information genuinely isn't available yet at the moment of
+        entry -- flagging so this isn't silently wrong later.
+
+        Does NOT touch dd_guard -- see the chronological drawdown replay
+        after the main per-symbol loop below for why that's handled as a
+        separate, correctly time-ordered pass instead of updated here
+        (this function runs in per-symbol, not true wall-clock, order;
+        see that block's own docstring for the full reasoning)."""
+        order = existing_orders[key]
+        opt_token = order.get('Option Token')
+        if not opt_token:
+            return
+        entry_ltp = float(order.get('Entry LTP') or 0)
+        stop_ltp = float(order.get('Stop Loss LTP') or 0)
+        target_ltp = float(order.get('Target LTP') or 0)
+        risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
+        entry_time_str = order.get('Pre-Entry Trigger Time')
+        quantity = int(order.get('Quantity (Units)') or 0)
+
+        result = position_manager.simulate_backtest_exit(
+            kite_api, opt_token, target_date, entry_time_str, entry_ltp,
+            stop_ltp, target_ltp, risk_per_unit, hist_cache,
+            signal_reversal_time_str=None,
+            quantity=quantity,
+        )
+        gross_pl = (result['exit_ltp'] - entry_ltp) * quantity
+        costs = position_manager.estimate_round_trip_costs(entry_ltp, result['exit_ltp'], quantity)
+        net_pl = round(gross_pl - costs['total'], 2)
+        order.update({
+            'Current LTP': result['exit_ltp'], 'Max LTP': result['max_ltp_seen'], 'Min LTP': result['min_ltp_seen'],
+            'Gross P/L (Rs)': round(gross_pl, 2), 'Costs (Rs)': costs['total'], 'Net P/L (Rs)': net_pl,
+            'Exit Time': result['exit_time'], 'Exit Reason': result['exit_reason'],
+        })
+
     def _process_symbol(sym, time_map):
         """[ADDED -- 14-Jul-26 resilience patch] The full 3-bar-streak
         scan for ONE symbol, pulled out of the main loop below so it can
@@ -1435,6 +1509,15 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         new_rec.update(flip_fields)
                         existing_orders[key] = new_rec
 
+                        # [ADDED -- Task 64] See _resolve_backtest_exit_now()'s
+                        # own docstring -- same fix as the main entry path
+                        # below, applied here too so the (currently OFF)
+                        # contrarian-flip path doesn't reintroduce the same
+                        # same-symbol re-entry-blocking bug if it's ever
+                        # turned on.
+                        if is_backtest:
+                            _resolve_backtest_exit_now(key)
+
                         if key in existing_orders:
                             exit_val = existing_orders[key].get('Exit Time', "")
                             if pd.isna(exit_val) or str(exit_val).strip() == "":
@@ -1602,6 +1685,17 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     })
                     existing_orders[key] = new_rec
 
+                    # [ADDED -- Task 64, 20-Jul-26 LIVE-vs-BACKTEST audit]
+                    # Resolve this order's real exit RIGHT NOW instead of
+                    # waiting for a separate pass after the whole day is
+                    # scanned -- see _resolve_backtest_exit_now()'s own
+                    # docstring for the bug this fixes (same-symbol re-entry
+                    # was blocked for the rest of the day, every time, since
+                    # has_open_position_in_symbol() could never see a real
+                    # exit until Phase 2 ran).
+                    if is_backtest:
+                        _resolve_backtest_exit_now(key)
+
                 if key in existing_orders:
                     exit_val = existing_orders[key].get('Exit Time', "")
                     if pd.isna(exit_val) or str(exit_val).strip() == "":
@@ -1654,10 +1748,16 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             _log_rejection(sym, "N/A", "SYSTEM_ERROR",
                             f"Symbol processing crashed and was skipped: {e}")
 
-    # --- Phase 2, BACKTEST only: resolve the REAL exit for every order
-    # that doesn't have one yet, via position_manager's historical candle
-    # walk-forward. This is what actually produces a trustworthy Net P/L
-    # instead of a hardcoded zero. ---
+    # --- Phase 2, BACKTEST only: SAFETY NET, not the primary path anymore.
+    # [CHANGED -- Task 64, 20-Jul-26] Every order now gets its real exit
+    # resolved IMMEDIATELY at creation time inside the per-symbol scan
+    # above (see _resolve_backtest_exit_now()) -- that's what fixed the
+    # same-symbol re-entry-blocking bug this audit found. This loop is
+    # kept as a defensive fallback for any order that somehow still
+    # doesn't have one (e.g. a future code path that creates an order
+    # without calling the helper) rather than deleted outright; in the
+    # normal case every order it looks at already has Net P/L set and it
+    # does nothing. ---
     if is_backtest:
         for key, order in existing_orders.items():
             if str(order.get('Net P/L (Rs)', "")).strip() not in ("", "nan"):
@@ -1691,35 +1791,56 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                 'Exit Time': result['exit_time'], 'Exit Reason': result['exit_reason'],
             })
 
-    # --- Phase 2.5, BACKTEST only: POST-HOC daily drawdown replay. ---
-    # [ADDED -- risk_and_signal_patches audit] Net P/L only exists after
-    # Phase 2 above, by which point every entry for the day was already
-    # taken in Phase 1 -- so dd_guard.breached() was never True during
-    # entry decisions this run (see DailyDrawdownGuard's docstring). This
-    # block answers a different, still-useful question after the fact:
-    # "walking through today's trades in the order they were ENTERED, at
-    # what point would the daily cap have been crossed, and how much of
-    # the day's loss came from trades opened after that point?" It's a
-    # diagnostic on top of the backtest, not a claim that any trade below
-    # was actually prevented.
+    # --- Phase 2.5, BACKTEST only: chronological daily drawdown ENFORCEMENT. ---
+    # [CHANGED -- Task 64, 20-Jul-26] This used to be a post-hoc REPORTING-
+    # only block (see DailyDrawdownGuard's own docstring, also updated
+    # this pass) -- it printed what the cap would have done but never
+    # actually removed any trade, because Phase 1's per-symbol scan
+    # processes one symbol's WHOLE day before moving to the next symbol,
+    # so dd_guard.breached() checked live during that scan is not in true
+    # wall-clock order across DIFFERENT symbols (e.g. symbol B's 09:15
+    # entry could get scanned after symbol A's 14:00 loss purely because
+    # A comes first in the symbol list, not because A's loss actually
+    # happened first). Rather than update dd_guard live during that scan
+    # (which would inherit that same cross-symbol ordering problem), the
+    # existing entry-time-sort here already gives TRUE wall-clock order
+    # across every symbol -- so this pass now replays through it for
+    # real and PRUNES (moves to Rejected) any order entered after the
+    # true breach point, exactly like the daily-drawdown check inside the
+    # main loop already does for LIVE. Note: pruning an order here can't
+    # retroactively re-open its symbol for an EARLIER-rejected same-
+    # symbol signal that was blocked by has_open_position_in_symbol() --
+    # that residual approximation is a much smaller effect than the bug
+    # this whole pass fixes and is left as a known limitation rather than
+    # chased to a full fixed point.
     if is_backtest:
-        entered_orders = [o for o in existing_orders.values() if str(o.get('Net P/L (Rs)', "")).strip() not in ("", "nan")]
-        entered_orders.sort(key=lambda o: str(o.get('Pre-Entry Trigger Time', "")))
+        entered_orders = [(key, o) for key, o in existing_orders.items()
+                           if str(o.get('Net P/L (Rs)', "")).strip() not in ("", "nan")]
+        entered_orders.sort(key=lambda pair: str(pair[1].get('Pre-Entry Trigger Time', "")))
         replay_guard = position_manager.DailyDrawdownGuard(max_daily_loss_rs=position_manager.DAILY_MAX_LOSS_RS)
-        pl_after_breach = 0.0
-        trades_after_breach = 0
-        for o in entered_orders:
+        pruned_keys = []
+        pl_pruned = 0.0
+        for key, o in entered_orders:
+            if replay_guard.breached():
+                sym = o.get('Symbol', '')
+                reason = (f"{sym}: Daily drawdown cap breached (realized Rs "
+                          f"{replay_guard.status()['realized_pl']:.2f} as of "
+                          f"{replay_guard.status()['breach_time']}). No new entries for the "
+                          f"rest of the session.")
+                _log_rejection(sym, o.get('Pre-Entry Trigger Time'), o.get('Pre-Entry Trigger Status'), reason)
+                pruned_keys.append(key)
+                pl_pruned += float(o.get('Net P/L (Rs)') or 0)
+                continue
             net_pl = float(o.get('Net P/L (Rs)') or 0)
-            was_breached_before = replay_guard.breached()
             replay_guard.update(net_pl, at_time_str=o.get('Pre-Entry Trigger Time'))
-            if was_breached_before:
-                pl_after_breach += net_pl
-                trades_after_breach += 1
-        if replay_guard.breached():
-            print(f"[RISK] Post-hoc replay: a Rs {position_manager.DAILY_MAX_LOSS_RS:.0f} daily cap would have "
-                  f"triggered at {replay_guard.status()['breach_time']} this session. {trades_after_breach} "
-                  f"trade(s) were entered after that point, contributing Rs {pl_after_breach:.2f} to the day's "
-                  f"total -- these would NOT have been taken live with the guard active.")
+        for key in pruned_keys:
+            del existing_orders[key]
+        if pruned_keys:
+            print(f"[RISK] Daily drawdown cap breached at {replay_guard.status()['breach_time']} this "
+                  f"session (realized Rs {replay_guard.status()['realized_pl']:.2f}). {len(pruned_keys)} "
+                  f"trade(s) entered after that point were removed from Orders and logged to Rejected "
+                  f"instead (Rs {pl_pruned:.2f} of P/L this backtest will no longer show) -- matching "
+                  f"what the same cap would have done LIVE.")
 
     df_orders_out = pd.DataFrame(list(existing_orders.values()), columns=ORDER_HEADERS)
     df_rejected_out = pd.DataFrame(rejected_rows, columns=REJECTED_HEADERS)

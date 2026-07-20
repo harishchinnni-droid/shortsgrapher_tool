@@ -581,20 +581,26 @@ class DailyDrawdownGuard:
     fix) genuinely blocks new entries mid-session once the daily cap is
     breached. This is the mode this class is designed for.
 
-    BACKTEST mode: build_order_sheet() resolves ALL of a day's entries
-    first (Phase 1, the per-symbol streak-detection loop), and only
-    THEN walks forward through each position's own candle history to
-    determine its real exit/P&L (Phase 2, the `if is_backtest:` block
-    after the main loop). Net P/L literally doesn't exist yet at the
-    point where Phase 1 decides whether to take a new trade -- so
-    .breached() will never be True during Phase 1 in backtest mode, no
-    matter how bad the day's resolved P&L turns out to be in Phase 2.
-    This is a structural property of the two-phase backtest design, not
-    a bug in this class. Treat the backtest use of this guard as a
-    POST-HOC reporting tool ("what would the cap have saved us, applied
-    retroactively in entry-time order?"), not a live-equivalent
-    circuit breaker -- see order_sheet.py's Phase 2.5 addition for how
-    this is surfaced without pretending it blocked anything it didn't.
+    BACKTEST mode: [CHANGED -- Task 64, 20-Jul-26] Each order's real exit
+    is now resolved IMMEDIATELY when it's created (order_sheet.py's
+    _resolve_backtest_exit_now(), called from inside the per-symbol
+    streak-detection loop), not in a separate pass after the whole day
+    is scanned -- so Net P/L exists right away. This instance
+    (build_order_sheet()'s own `dd_guard`) is still NOT updated live
+    during that per-symbol scan, though, because the scan processes one
+    symbol's whole day before moving to the next symbol -- checking
+    .breached() there would see a LATER trade from an earlier-processed
+    symbol before an EARLIER trade from a later-processed one, which
+    isn't true wall-clock order. Instead, order_sheet.py's Phase 2.5
+    runs a SEPARATE DailyDrawdownGuard instance through every entered
+    order sorted by real entry time (true chronological order across
+    every symbol) and PRUNES -- moves to Rejected -- any order entered
+    after the true breach point. That's what actually enforces the cap
+    in backtest now, equivalent to what LIVE's persisted instance does
+    by construction (LIVE's entries genuinely happen in real time, one
+    cycle at a time, so this class updating live there was already
+    correct). See order_sheet.py's Phase 2.5 block for the enforcement
+    itself.
     """
 
     def __init__(self, max_daily_loss_rs=DAILY_MAX_LOSS_RS, cache_path=None, date_key=None):
