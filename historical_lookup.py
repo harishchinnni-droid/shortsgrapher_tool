@@ -1,17 +1,34 @@
 """
 historical_lookup.py
 ---------------------
-BACKTEST-only replacements for every live kite_api.quote() call that
-order_sheet.py's gates otherwise depend on. It is wrong for BACKTEST: a
-backtest for 06-Jul-26 run on the evening of 10-Jul-26 would have every
-one of those gates evaluated against 10-Jul-26's post-close quote, not
-against the actual market conditions at each historical signal's own
-timestamp. This was confirmed in an actual multi-day backtest output
-that motivated this fix: the same PCR value appeared unchanged across
-four different intraday timestamps for the same symbol, and a large
-share of rejections were "Entry LTP Rs.0.00" -- a live quote() call
-returning nothing outside its own live session, not a genuinely dead
-option.
+Originally BACKTEST-only replacements for every live kite_api.quote()
+call that order_sheet.py's gates otherwise depend on. It was wrong for
+BACKTEST: a backtest for 06-Jul-26 run on the evening of 10-Jul-26 would
+have every one of those gates evaluated against 10-Jul-26's post-close
+quote, not against the actual market conditions at each historical
+signal's own timestamp. This was confirmed in an actual multi-day
+backtest output that motivated this fix: the same PCR value appeared
+unchanged across four different intraday timestamps for the same symbol,
+and a large share of rejections were "Entry LTP Rs.0.00" -- a live
+quote() call returning nothing outside its own live session, not a
+genuinely dead option.
+
+[CHANGED -- Task 65, 20-Jul-26] get_historical_pcr() and get_historical_
+oi_buildup() (plus the get_option_snapshot() they both share) now also
+run in LIVE mode, via a new is_live=True path -- Harish's explicit
+request once he saw that BACKTEST's PCR/OI-buildup gates compare actual
+option candles (current bar vs. one N-minutes-earlier) while LIVE's own
+versions (calculate_local_pcr() / get_oi_buildup_signal(), still defined
+below but no longer called by order_sheet.py) instead compared a live
+quote() snapshot against whatever the LAST POLL of that exact contract
+happened to be -- a materially different method, not just a different
+data source, since "last poll" isn't a fixed time window and depends on
+how often that specific contract came up. LIVE now uses the SAME
+candle-comparison method as BACKTEST for these two gates specifically;
+see fetch_option_live_candles() below for how that's sourced safely for
+an ongoing (not yet closed) trading day. Entry LTP, spot price, and VIX
+are UNCHANGED -- still live kite_api.quote() calls in order_sheet.py --
+this only applies to the PCR and OI-buildup gates.
 
 Every function below returns a value AS OF a specific historical
 (target_date, time_str) pair, sourced from Kite's historical_data()
@@ -59,6 +76,7 @@ import os
 import pandas as pd
 
 import data_ingestion  # HIST_DIR + the already-downloaded underlying 5-min CSVs
+from ist_clock import now_ist
 
 MARKET_OPEN = (9, 0)
 MARKET_DATA_END = (15, 35)
@@ -176,10 +194,70 @@ def fetch_option_day_candles(kite_api, opt_token, target_date, cache, interval='
     return df
 
 
-def get_option_snapshot(kite_api, opt_token, target_date, time_str, cache, interval='5minute'):
+def fetch_option_live_candles(kite_api, opt_token, cache, interval='5minute'):
+    """[ADDED -- Task 65, 20-Jul-26] LIVE equivalent of
+    fetch_option_day_candles() above -- same shape of result (a candle
+    DataFrame, OI included), same in-memory cache dict, but sourced
+    safely for an ONGOING trading day instead of a closed BACKTEST one.
+    Two differences from the BACKTEST version, both required because
+    today is not immutable the way every backtest date is:
+
+      1. Fetches from market open through NOW (not a fixed end-of-day
+         to_date), and drops the still-forming tail candle the same way
+         data_ingestion.py's own full backfill does for the underlying
+         (see that module's "CANDLE-CLOSE AWARENESS" note) -- without
+         this, a signal could get graded against a candle that hasn't
+         actually finished forming yet, the exact repainting bug that
+         guard exists to prevent.
+      2. In-memory cached ONLY, scoped to the one HistoricalCache
+         instance a single build_order_sheet() LIVE call creates for
+         itself (a fresh instance every 5-minute cycle, same lifetime
+         as everything else that call computes) -- NEVER written to
+         OPTION_HIST_DIR's disk cache, since a partial trading day has
+         to be re-fetched fresh every cycle, not frozen after its first
+         partial fetch the way a genuinely closed backtest day safely
+         can be.
+
+    If opt_token is None, or the fetch fails/returns nothing, returns an
+    empty DataFrame -- callers already handle that the same way they do
+    for fetch_option_day_candles()."""
+    if opt_token is None:
+        return pd.DataFrame()
+
+    key = (int(opt_token), 'LIVE')
+    if key in cache.option_candles:
+        return cache.option_candles[key]
+
+    now = now_ist()
+    from_dt = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
+    cache.limiter.acquire()
+    try:
+        raw = kite_api.historical_data(int(opt_token), from_dt, now, interval, oi=True)
+        df = pd.DataFrame(raw)
+        if not df.empty:
+            df['date'] = pd.to_datetime(df['date'])
+            if df['date'].dt.tz is not None:
+                df['date'] = df['date'].dt.tz_localize(None)
+            df.set_index('date', inplace=True)
+            df.sort_index(inplace=True)
+            df, _dropped = data_ingestion._drop_unclosed_candles(
+                df, interval, now, f"option token {opt_token}", "LIVE PCR/OI-buildup gate"
+            )
+    except Exception as e:
+        print(f"[WARNING] historical_lookup: LIVE option candle fetch failed for token {opt_token} ({e}).")
+        df = pd.DataFrame()
+
+    cache.option_candles[key] = df
+    return df
+
+
+def get_option_snapshot(kite_api, opt_token, target_date, time_str, cache, interval='5minute', is_live=False):
     """{'close','high','low','volume','oi'} for opt_token AT OR BEFORE
-    time_str on target_date, or None if unavailable."""
-    df = fetch_option_day_candles(kite_api, opt_token, target_date, cache, interval)
+    time_str on target_date, or None if unavailable. [CHANGED -- Task 65]
+    is_live=True sources candles via fetch_option_live_candles() instead
+    of fetch_option_day_candles() -- see that function's docstring."""
+    df = (fetch_option_live_candles(kite_api, opt_token, cache, interval) if is_live
+          else fetch_option_day_candles(kite_api, opt_token, target_date, cache, interval))
     row = _candle_at_or_before(df, time_str_to_dt(target_date, time_str))
     if row is None:
         return None
@@ -199,25 +277,38 @@ def get_option_snapshot(kite_api, opt_token, target_date, time_str, cache, inter
 ALLOW_SHORT_COVERING_CONFIRM = False
 
 
-def get_historical_oi_buildup(kite_api, opt_token, target_date, time_str, cache, signal, lookback_minutes=5):
+def get_historical_oi_buildup(kite_api, opt_token, target_date, time_str, cache, signal,
+                               lookback_minutes=5, is_live=False):
     """Historical replacement for order_sheet.get_oi_buildup_signal().
 
-    The original LIVE version compares this poll's OI+price against a
-    JSON snapshot cache keyed only by opt_symbol with NO DATE in the key
-    -- fine for a single live session, but replaying several backtest
-    dates for the same recurring contract would silently compare one
-    day's OI against a DIFFERENT day's OI. This version instead compares
-    two points on the SAME day's own historical candle sequence (current
-    bar vs. `lookback_minutes` earlier), which is unambiguous regardless
-    of how many backtest dates get run, needs no persisted cache file,
-    and can't leak across runs.
+    The original LIVE version (order_sheet.get_oi_buildup_signal(), still
+    defined there but no longer called as of Task 65) compared this
+    poll's OI+price against a JSON snapshot cache keyed only by
+    opt_symbol with NO DATE in the key -- fine-ish for a single live
+    session, but replaying several backtest dates for the same recurring
+    contract would silently compare one day's OI against a DIFFERENT
+    day's OI, and even within one live session "prior" meant "whenever
+    this contract was last polled" rather than a fixed window. This
+    version instead compares two points on the SAME day's own candle
+    sequence (current bar vs. `lookback_minutes` earlier), which is
+    unambiguous regardless of how many backtest dates get run, needs no
+    persisted cache file, and can't leak across runs or drift with
+    however often a contract happens to get checked.
+
+    [CHANGED -- Task 65, 20-Jul-26] is_live=True runs this exact same
+    comparison for LIVE too (Harish's request), sourcing both the
+    current and prior candle from fetch_option_live_candles() instead of
+    fetch_option_day_candles() -- see that function's docstring for why
+    an ongoing trading day needs a different (in-memory-only, closed-
+    candle-filtered) fetch than a closed BACKTEST date.
     """
-    current = get_option_snapshot(kite_api, opt_token, target_date, time_str, cache)
+    current = get_option_snapshot(kite_api, opt_token, target_date, time_str, cache, is_live=is_live)
     if current is None:
         return "INSUFFICIENT_DATA", True
 
     prior_dt = time_str_to_dt(target_date, time_str) - pd.Timedelta(minutes=lookback_minutes)
-    df = fetch_option_day_candles(kite_api, opt_token, target_date, cache)
+    df = (fetch_option_live_candles(kite_api, opt_token, cache) if is_live
+          else fetch_option_day_candles(kite_api, opt_token, target_date, cache))
     prior_row = _candle_at_or_before(df, prior_dt)
     if prior_row is None:
         return "INSUFFICIENT_DATA", True
@@ -391,7 +482,15 @@ def resolve_pcr_chain_tokens(base_symbol, spot_price, df_ref, kite_master,
 
 
 def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, kite_master,
-                        kite_api, cache, strikes_each_side=5, strike_step_default=50):
+                        kite_api, cache, strikes_each_side=5, strike_step_default=50, is_live=False):
+    """[CHANGED -- Task 65, 20-Jul-26] is_live=True sources every strike's
+    OI from fetch_option_live_candles() instead of fetch_option_day_
+    candles() (via get_option_snapshot's own is_live passthrough) -- same
+    put/call OI summation either way, just a LIVE-safe candle source.
+    Replaces order_sheet.calculate_local_pcr() (still defined there but
+    no longer called as of this change) for LIVE too, per Harish's
+    request that LIVE's PCR gate use the same method BACKTEST's already
+    did."""
     if not spot_price:
         return None
 
@@ -402,7 +501,7 @@ def get_historical_pcr(base_symbol, spot_price, target_date, time_str, df_ref, k
 
     put_oi, call_oi = 0.0, 0.0
     for token, tsym in chain_tokens:
-        snap = get_option_snapshot(kite_api, token, target_date, time_str, cache)
+        snap = get_option_snapshot(kite_api, token, target_date, time_str, cache, is_live=is_live)
         if snap is None:
             continue
         tsym = str(tsym)

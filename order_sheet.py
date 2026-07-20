@@ -621,8 +621,17 @@ def resolve_option_chain(base_symbol, spot_price, signal, df_ref, kite_master):
 
 
 def calculate_local_pcr(base_symbol, spot_price, df_ref, kite_master, kite_api):
-    """LIVE ONLY. Put-Call OI ratio across the ATM +/-5 strikes of the
-    nearest expiry, from a live quote() snapshot."""
+    """[SUPERSEDED -- Task 65, 20-Jul-26] No longer called. LIVE's PCR
+    gate now uses historical_lookup.get_historical_pcr(is_live=True) --
+    the SAME candle-based method BACKTEST already used -- per Harish's
+    explicit request once he saw the two modes were computing PCR
+    differently (this function: one live quote() snapshot; BACKTEST's:
+    each strike's OI read off its own recent 5-min candle). Left defined,
+    not deleted, in case of a future A/B need to compare the two methods
+    again; nothing in this file calls it anymore.
+
+    Put-Call OI ratio across the ATM +/-5 strikes of the nearest expiry,
+    from a live quote() snapshot."""
     diff_val = DEFAULT_STRIKE_STEP
     if 'Option Price Difference' in df_ref.columns:
         match = _match_symbol(df_ref, base_symbol)
@@ -686,11 +695,22 @@ def get_expiry_context(base_symbol, df_ref, as_of_date):
 
 
 def get_oi_buildup_signal(opt_symbol, current_oi, current_price, signal, cache_path=OI_SNAPSHOT_CACHE):
-    """LIVE ONLY. Compares this poll's OI+price for opt_symbol against
-    the last cached snapshot to classify the OI buildup quadrant. First
-    sighting of a contract always confirms. This intentionally persists
-    across runs -- correct for LIVE's poll-to-poll comparison during a
-    single trading session. BACKTEST never calls this; see
+    """[SUPERSEDED -- Task 65, 20-Jul-26] No longer called. LIVE's
+    OI-buildup gate now uses historical_lookup.get_historical_oi_buildup
+    (is_live=True) -- the SAME two-candle comparison BACKTEST already
+    used (current bar vs. a fixed N minutes earlier), instead of this
+    function's "compare against whenever this contract was last polled"
+    approach, which wasn't a fixed time window and depended on how often
+    a given contract happened to come up for a check. Left defined, not
+    deleted, in case of a future A/B need; nothing in this file calls it
+    anymore, and OI_SNAPSHOT_CACHE's JSON file will simply stop being
+    written to.
+
+    Compares this poll's OI+price for opt_symbol against the last cached
+    snapshot to classify the OI buildup quadrant. First sighting of a
+    contract always confirms. This intentionally persists across runs --
+    correct for LIVE's poll-to-poll comparison during a single trading
+    session. BACKTEST never calls this; see
     historical_lookup.get_historical_oi_buildup(), which compares two
     historical bars instead and never touches this file.
 
@@ -828,6 +848,10 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     is_backtest = (mode == calendar_mgmt.BACKTEST)
     if is_backtest and target_date is None:
         raise ValueError("build_order_sheet: target_date is required when mode=calendar_mgmt.BACKTEST")
+    # [ADDED -- Task 65] The PCR/OI-buildup gates' historical_lookup calls
+    # need a concrete date for both modes now (see is_live's own
+    # docstrings) -- target_date itself for BACKTEST, today for LIVE.
+    effective_date = target_date if is_backtest else today_ist()
 
     final_table, sorted_times = _load_final_recomm_table(output_excel_path)
     adx_lookup = _load_metric_lookup(output_excel_path, 'HTF Bias', 'ADX Value')
@@ -862,7 +886,15 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # PCR_TREND_CACHE -- see PCRTrendTracker's docstring for why this was
     # the actual cause of PCR Trend showing INSUFFICIENT_DATA constantly.
     pcr_tracker = PCRTrendTracker(cache_path=None if is_backtest else PCR_TREND_CACHE)
-    hist_cache = historical_lookup.HistoricalCache(kite_api) if is_backtest else None
+    # [CHANGED -- Task 65, 20-Jul-26] LIVE now gets one too -- needed for
+    # the PCR/OI-buildup gates' new is_live=True candle path (see
+    # historical_lookup.fetch_option_live_candles()). Same lifetime as
+    # everything else here: a fresh instance every 5-minute LIVE cycle,
+    # since build_order_sheet() itself is re-invoked each cycle -- no
+    # stale-across-cycles risk from reusing this instance longer than
+    # that, and the in-memory-only LIVE candle cache is exactly what
+    # that function requires (never touches the BACKTEST disk cache).
+    hist_cache = historical_lookup.HistoricalCache(kite_api)
 
     # [ADDED -- Task 60] Warm hist_cache concurrently BEFORE the
     # sequential trade-logic loop below runs -- see
@@ -1168,12 +1200,11 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         if is_expiry_day and (t1_time.hour > 14 or (t1_time.hour == 14 and t1_time.minute >= 30)):
             return None, f"{opt_symbol}: [Contrarian Flip] Expiry Day, within last 45min of session -- theta/gamma risk too high for fresh entry."
 
-        if is_backtest:
-            oi_quadrant, oi_confirms = historical_lookup.get_historical_oi_buildup(
-                kite_api, opt_token, target_date, t1, hist_cache, flipped_signal
-            )
-        else:
-            oi_quadrant, oi_confirms = get_oi_buildup_signal(opt_symbol, opt_oi, entry_ltp, flipped_signal, oi_cache_path)
+        # [CHANGED -- Task 65] Unified OI-buildup method for both modes --
+        # see get_historical_oi_buildup's own docstring.
+        oi_quadrant, oi_confirms = historical_lookup.get_historical_oi_buildup(
+            kite_api, opt_token, effective_date, t1, hist_cache, flipped_signal, is_live=not is_backtest
+        )
         if ENABLE_OI_BUILDUP_GATE and not oi_confirms:
             return None, f"{opt_symbol}: [Contrarian Flip] OI buildup contradicts signal ({oi_quadrant} on {flipped_signal}). Writers positioned against this move."
 
@@ -1347,12 +1378,13 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                             eager_quote = kite_api.quote([f"NSE:{sym}"])
                             eager_spot = eager_quote.get(f"NSE:{sym}", {}).get('last_price', 0)
                         if eager_spot:
-                            if is_backtest:
-                                eager_pcr = historical_lookup.get_historical_pcr(
-                                    sym, eager_spot, target_date, t1, df_ref, kite_master, kite_api, hist_cache
-                                )
-                            else:
-                                eager_pcr = calculate_local_pcr(sym, eager_spot, df_ref, kite_master, kite_api)
+                            # [CHANGED -- Task 65] Unified PCR method for
+                            # both modes -- see get_historical_pcr's own
+                            # docstring for what is_live changes.
+                            eager_pcr = historical_lookup.get_historical_pcr(
+                                sym, eager_spot, effective_date, t1, df_ref, kite_master, kite_api, hist_cache,
+                                is_live=not is_backtest,
+                            )
                             pcr_tracker.record(sym, eager_pcr)
                 except Exception as e:
                     print(f"[WARNING] Eager PCR recording failed for {sym} at {t1}: {e}")
@@ -1426,12 +1458,12 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         sym, spot_price, s1, df_ref, kite_master
                     )
 
-                    if is_backtest:
-                        pcr_val = historical_lookup.get_historical_pcr(
-                            sym, spot_price, target_date, t1, df_ref, kite_master, kite_api, hist_cache
-                        )
-                    else:
-                        pcr_val = calculate_local_pcr(sym, spot_price, df_ref, kite_master, kite_api)
+                    # [CHANGED -- Task 65] Unified PCR method for both
+                    # modes -- see get_historical_pcr's own docstring.
+                    pcr_val = historical_lookup.get_historical_pcr(
+                        sym, spot_price, effective_date, t1, df_ref, kite_master, kite_api, hist_cache,
+                        is_live=not is_backtest,
+                    )
                     pcr_tracker.record(sym, pcr_val)
 
                     entry_ltp, opt_vol, opt_oi = 0, 0, 0
@@ -1611,12 +1643,12 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         current_signal_streak = None
                         continue
 
-                    if is_backtest:
-                        oi_quadrant, oi_confirms = historical_lookup.get_historical_oi_buildup(
-                            kite_api, opt_token, target_date, t1, hist_cache, s1
-                        )
-                    else:
-                        oi_quadrant, oi_confirms = get_oi_buildup_signal(opt_symbol, opt_oi, entry_ltp, s1, oi_cache_path)
+                    # [CHANGED -- Task 65] Unified OI-buildup method for
+                    # both modes -- see get_historical_oi_buildup's own
+                    # docstring.
+                    oi_quadrant, oi_confirms = historical_lookup.get_historical_oi_buildup(
+                        kite_api, opt_token, effective_date, t1, hist_cache, s1, is_live=not is_backtest
+                    )
                     # [CHANGED -- 16-Jul-26 audit] See ENABLE_OI_BUILDUP_GATE
                     # docstring above -- oi_quadrant is still resolved and
                     # still lands in the 'OI Signal' column below either way;
