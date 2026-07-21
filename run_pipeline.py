@@ -172,7 +172,25 @@ def run_pipeline_for_date(smart_api, kite_api, target_date, mode):
 
         if already_exists and not stale:
             print("[SYSTEM] Historical data already available for today -- skipping full backfill.")
-            data_ingestion.update_incremental_data(df_ref, target_date, kite_api)
+            # [FIXED -- Task 69, 21-Jul-26] Only catch up incrementally in
+            # LIVE mode. update_incremental_data() always fetches up to
+            # the real wall-clock now_ist() as both its Kite `to_date` and
+            # its "is this candle closed yet" cutoff -- correct for LIVE
+            # (today's session is still in progress), but wrong for
+            # BACKTEST: target_date there is a past, fully-closed trading
+            # day, so there is nothing left to "catch up" and no
+            # legitimate "now" to compare against. Previously this ran
+            # unconditionally, which is what let a BACKTEST re-run reach
+            # into today's real-time candles and merge them into a
+            # supposedly-closed historical day's CSV -- and was the actual
+            # trigger for the tz-naive/tz-aware crash Harish hit (see
+            # data_ingestion.py Task 68 fix): it's the code path that
+            # exercises live Kite fetches against an old on-disk file.
+            if is_live:
+                data_ingestion.update_incremental_data(df_ref, target_date, kite_api)
+            else:
+                print("[SYSTEM] BACKTEST target date already fully downloaded (closed trading "
+                      "day) -- no incremental catch-up needed.")
         else:
             if stale:
                 print("[WARNING] Existing data on disk extends beyond the current time -- "

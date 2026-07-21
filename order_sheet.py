@@ -139,6 +139,32 @@ from ist_clock import today_ist
 
 IST = pytz.timezone('Asia/Kolkata')
 
+
+def _safe_int(value, default=0):
+    """[ADDED -- Task 67, 21-Jul-26] NaN-safe int coercion.
+
+    `int(order.get('col') or 0)` looks safe but isn't: pandas represents a
+    blank Excel cell read back via pd.read_excel() as float('nan'), and
+    `nan or 0` evaluates to `nan` (NaN is a non-zero float, so it's
+    truthy) -- not `0`. `int(nan)` then raises
+    'ValueError: cannot convert float NaN to integer', which is exactly
+    what crashed LIVE cycle 8 in update_open_positions_live() on a row
+    where 'TSL Breach Streak' hadn't been populated yet. This checks for
+    NaN explicitly before the int() conversion instead of relying on
+    truthiness."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -1302,7 +1328,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         target_ltp = float(order.get('Target LTP') or 0)
         risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
         entry_time_str = order.get('Pre-Entry Trigger Time')
-        quantity = int(order.get('Quantity (Units)') or 0)
+        quantity = _safe_int(order.get('Quantity (Units)'))  # [FIXED -- Task 67] NaN-safe
 
         result = position_manager.simulate_backtest_exit(
             kite_api, opt_token, target_date, entry_time_str, entry_ltp,
@@ -1804,7 +1830,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
             entry_time_str = order.get('Pre-Entry Trigger Time')
             reversal_time_str = order.get('Exit Trigger Time') or None
-            quantity = int(order.get('Quantity (Units)') or 0)  # [MOVED] up so it can be passed in below
+            quantity = _safe_int(order.get('Quantity (Units)'))  # [MOVED / FIXED -- Task 67] NaN-safe
 
             result = position_manager.simulate_backtest_exit(
                 kite_api, opt_token, target_date, entry_time_str, entry_ltp,
@@ -2015,6 +2041,17 @@ def update_open_positions_live(kite_api, output_excel_path):
     if df_orders.empty:
         return
 
+    # [FIXED -- Task 67, 21-Jul-26] When every row's 'Exit Time'/'Exit
+    # Reason' cell is still blank (all still-open positions), pandas
+    # infers those columns as float64 (an all-NaN column). Writing a
+    # string into an at[] cell of a float64 column is deprecated and
+    # raises FutureWarning today, a hard error in a future pandas -- cast
+    # both to plain object dtype up front so the later string assignment
+    # is unremarkable.
+    for _col in ('Exit Time', 'Exit Reason'):
+        if _col in df_orders.columns:
+            df_orders[_col] = df_orders[_col].astype(object)
+
     now = datetime.now(IST)
     changed = False
 
@@ -2040,8 +2077,8 @@ def update_open_positions_live(kite_api, output_excel_path):
         risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
         max_ltp_seen = float(order.get('Max LTP') or entry_ltp)
         min_ltp_seen = float(order.get('Min LTP') or entry_ltp)
-        tsl_breach_streak = int(order.get('TSL Breach Streak') or 0)  # [ADDED] see position_manager.check_live_exit()
-        quantity = int(order.get('Quantity (Units)') or 0)  # [MOVED] up so it can be passed in below
+        tsl_breach_streak = _safe_int(order.get('TSL Breach Streak'))  # [FIXED -- Task 67] see position_manager.check_live_exit()
+        quantity = _safe_int(order.get('Quantity (Units)'))  # [MOVED] up so it can be passed in below
         pre_entry_time = order.get('Pre-Entry Trigger Time')
         try:
             entry_dt = now.replace(

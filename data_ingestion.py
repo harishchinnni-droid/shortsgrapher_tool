@@ -212,6 +212,17 @@ def fetch_historical_worker(sym, token, from_date, to_date, kite_api, date_str, 
 
             df_hist['date'] = pd.to_datetime(df_hist['date'])
             df_hist.set_index('date', inplace=True)
+            # [FIXED -- Task 68, 21-Jul-26] Strip Kite's tz-aware index
+            # immediately, same reasoning as fetch_incremental_worker
+            # below. Previously this was skipped entirely for BACKTEST
+            # (now_cutoff=None short-circuits _drop_unclosed_candles as a
+            # no-op), so every BACKTEST-written CSV kept a tz-aware
+            # ("...+05:30") index baked into its 'date' column -- exactly
+            # what caused "Cannot compare tz-naive and tz-aware
+            # timestamps" the next time update_incremental_data() read
+            # that file back and concatenated it against a freshly
+            # (now-also-stripped) fetched frame.
+            df_hist.index = _strip_tz(df_hist.index)
 
             # [FIX -- 13-Jul-26] CLOSE-time guard, not open-time guard --
             # see the module-level "CANDLE-CLOSE AWARENESS" note above for
@@ -355,6 +366,22 @@ def fetch_incremental_worker(sym, token, kite_api, interval, csv_path, limiter, 
     if os.path.exists(csv_path):
         try:
             existing = pd.read_csv(csv_path, parse_dates=['date'], index_col='date')
+            # [FIXED -- Task 68, 21-Jul-26] Some CSVs on disk were written by
+            # the BACKTEST full-backfill path (fetch_historical_worker with
+            # cap_to_now=False -> now_cutoff=None), which skips
+            # _drop_unclosed_candles entirely and therefore never stripped
+            # Kite's tz-aware ("...+05:30") index before saving. Reading
+            # that string back with parse_dates then reconstructs a
+            # tz-AWARE index here, while a freshly-fetched df_new below is
+            # tz-aware too but from a DIFFERENT moment -- and older CSVs
+            # written before this fix may be naive. Any naive/aware mix
+            # between `existing` and `df_new` blows up downstream at
+            # pd.concat(...).sort_index() with "Cannot compare tz-naive
+            # and tz-aware timestamps". Stripping immediately on read
+            # guarantees `existing` is always naive, regardless of which
+            # code path or which day originally wrote the file.
+            if existing.index.tzinfo is not None:
+                existing.index = _strip_tz(existing.index)
         except Exception:
             existing = None  # unreadable/corrupt -- fall through to a fresh catch-up fetch
 
@@ -374,6 +401,15 @@ def fetch_incremental_worker(sym, token, kite_api, interval, csv_path, limiter, 
 
     df_new['date'] = pd.to_datetime(df_new['date'])
     df_new.set_index('date', inplace=True)
+    # [FIXED -- Task 68, 21-Jul-26] Kite always returns tz-aware
+    # timestamps; strip immediately on receipt so df_new's index is naive
+    # from this point on, matching `existing` above and `now`/`from_date`
+    # everywhere else in this module. Previously only a transient stripped
+    # COPY of this index was used inside _drop_unclosed_candles' internal
+    # mask -- the DataFrame actually returned (and later concatenated/
+    # saved to disk) kept its original tz-aware index, which is what let
+    # the mismatch reach pd.concat(...).sort_index() below.
+    df_new.index = _strip_tz(df_new.index)
 
     # [FIX -- 13-Jul-26] CLOSE-time guard, not open-time guard -- see the
     # module-level "CANDLE-CLOSE AWARENESS" note above. This call's own

@@ -94,8 +94,14 @@ from openpyxl.utils import get_column_letter
 # Config -- same ALGO_BASE_DIR portability convention the rest of the
 # project uses (see file_mgmt.py), reproduced here inline rather than
 # imported, per the "no dependency on other codes" requirement.
+# [CHANGED -- Task 66, 21-Jul-26] same auto-detect-from-__file__ fallback
+# as file_mgmt.py, instead of a hardcoded F:\ path -- see that file's
+# BASE_DIR comment for why.
 # ---------------------------------------------------------------------------
-BASE_DIR = os.environ.get("ALGO_BASE_DIR", r"F:\05_Claude_Automation")
+BASE_DIR = os.environ.get(
+    "ALGO_BASE_DIR",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
 YTD_FILENAME = "YTD Dashboard.xlsx"
 YTD_PATH = os.path.join(BASE_DIR, YTD_FILENAME)
 

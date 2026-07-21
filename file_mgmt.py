@@ -1,16 +1,25 @@
 import os
 import shutil
 
-# [CHANGED -- cloud/Colab portability] BASE_DIR now resolves from the
-# ALGO_BASE_DIR environment variable first, falling back to the original
-# hardcoded Windows path so nothing changes for existing desktop runs
-# where that variable isn't set. Set ALGO_BASE_DIR in Colab (or any
-# non-Windows environment) to your mounted Drive folder, e.g.
-# '/content/drive/MyDrive/02_Claude_Trading'. Every other module that
-# needs this pipeline's root folder imports BASE_DIR from HERE instead of
-# hardcoding its own copy -- one place to point at a new environment,
-# not six.
-BASE_DIR = os.environ.get("ALGO_BASE_DIR", r"F:\05_Claude_Automation")
+# [CHANGED -- Task 66, 21-Jul-26, office-laptop portability] BASE_DIR now
+# resolves from the ALGO_BASE_DIR environment variable first; if that's
+# not set, it's auto-detected as the PARENT of the folder this file lives
+# in (e.g. this file at 'D:\06_Claude_Automation\05_Codes\file_mgmt.py'
+# resolves BASE_DIR to 'D:\06_Claude_Automation'), instead of a hardcoded
+# 'F:\05_Claude_Automation'. The hardcoded fallback is exactly what broke
+# LIVE on Harish's office laptop: the code folder there is
+# 'D:\06_Claude_Automation\05_Codes' (different drive letter AND different
+# folder name), so the old fallback pointed at a path that doesn't exist
+# on that machine, and os.makedirs() in token_mgmt.py crashed trying to
+# create drive 'F:\' itself (WinError 3). Auto-detecting from __file__
+# means this now works unmodified on ANY machine/drive/folder-name
+# without needing to set ALGO_BASE_DIR by hand -- the env var is kept
+# only as an explicit override for non-Windows setups (Colab etc.) where
+# auto-detection from a local script path wouldn't make sense anyway.
+BASE_DIR = os.environ.get(
+    "ALGO_BASE_DIR",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
 SOURCE_FILE = os.path.join(BASE_DIR, "01_SourceFile.xlsx")
 
 # [ADDED -- Phase B] The Reference/symbol template now lives natively in

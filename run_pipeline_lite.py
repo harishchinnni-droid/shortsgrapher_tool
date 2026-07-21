@@ -82,7 +82,17 @@ def run_pipeline_for_date_lite(smart_api, kite_api, target_date, mode):
 
         if already_exists and not stale:
             print("[SYSTEM] Historical data already available for today -- skipping full backfill.")
-            data_ingestion.update_incremental_data(df_ref, target_date, kite_api)
+            # [FIXED -- Task 69, 21-Jul-26] Same fix as run_pipeline.py --
+            # only catch up incrementally in LIVE mode. See that file's
+            # comment for the full reasoning: this unconditional call was
+            # the actual trigger for the tz-naive/tz-aware crash, since it
+            # ran a live-"now"-based fetch/merge against a BACKTEST target
+            # date's already-closed, supposedly-immutable CSV.
+            if is_live:
+                data_ingestion.update_incremental_data(df_ref, target_date, kite_api)
+            else:
+                print("[SYSTEM] BACKTEST target date already fully downloaded (closed trading "
+                      "day) -- no incremental catch-up needed.")
         else:
             if stale:
                 print("[WARNING] Existing data on disk extends beyond the current time -- "
