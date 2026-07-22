@@ -54,6 +54,26 @@ Max LTP with P/L = 0. Root causes, all fixed here:
      the wrong way before rejecting -- the first few readings of the day
      always pass since there's no trend yet.
 
+[CHANGED -- Task 65 (20-Jul-26) + Task 71 (22-Jul-26)] Point 1 above ("LIVE
+is unchanged") is no longer true. Harish's own LIVE-vs-BACKTEST audit for
+22-Jul-26 (a same-day run of both, for direct comparison) showed BACKTEST
+and LIVE resolving to DIFFERENT option strikes/tokens for the identical
+signal (e.g. BAJAJ-AUTO), because BACKTEST's spot price came from the last
+CLOSED 5-min candle while LIVE's came from a live kite_api.quote() tick --
+close enough most of the time to not matter, but occasionally far enough
+apart (a fast 5-min bar) to round to a different ATM strike and send the
+two modes down entirely different option contracts. Every pre-entry
+decision -- spot price, Entry LTP/volume/OI, VIX, PCR, OI-buildup -- now
+sources from the same closed-candle data in BOTH modes (LIVE's fetch just
+adds a "market-open-through-now, drop the still-forming tail candle"
+window instead of BACKTEST's fixed whole-day window; see historical_
+lookup.py's fetch_option_live_candles()/get_vix_snapshot(is_live=True)).
+Only position monitoring AFTER an order is already open (SL/TSL, in
+update_open_positions_live()) still uses a real-time kite_api.quote() --
+that's correct and intentional, per Harish's own explicit instruction:
+closed candles decide whether/how to place an order, live prices decide
+when to exit one already placed.
+
 Trigger rule (per your instruction -- "check for BUY CE or BUY PE signals
 in 03 subsequent columns"):
     Slide a 3-column window across the sorted time columns of a symbol's
@@ -689,7 +709,10 @@ def calculate_local_pcr(base_symbol, spot_price, df_ref, kite_master, kite_api):
 
 
 def get_india_vix(kite_api):
-    """LIVE ONLY."""
+    """[SUPERSEDED -- Task 71, 22-Jul-26] No longer called -- the VIX gate
+    now uses historical_lookup.get_vix_snapshot(..., is_live=True) for
+    LIVE too, same closed-candle treatment as BACKTEST. Left defined in
+    case a future need for a genuine real-time VIX tick comes up. LIVE ONLY."""
     try:
         quote_data = kite_api.quote(["NSE:INDIA VIX"])
         return quote_data.get("NSE:INDIA VIX", {}).get('last_price', None)
@@ -1186,21 +1209,15 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             sym, spot_price, flipped_signal, df_ref, kite_master
         )
 
+        # [CHANGED -- Task 71, 22-Jul-26] Same closed-candle unification as
+        # the main entry path -- see get_option_snapshot's is_live docstring.
         entry_ltp, opt_vol, opt_oi = 0, 0, 0
         if opt_symbol:
-            if is_backtest:
-                snap = historical_lookup.get_option_snapshot(kite_api, opt_token, target_date, t1, hist_cache)
-                if snap:
-                    entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
-            else:
-                try:
-                    opt_quote = kite_api.quote([f"NFO:{opt_symbol}"])
-                    opt_data = opt_quote.get(f"NFO:{opt_symbol}", {})
-                    entry_ltp = opt_data.get('last_price', 0)
-                    opt_vol = opt_data.get('volume', 0)
-                    opt_oi = opt_data.get('oi', 0)
-                except Exception:
-                    pass
+            snap = historical_lookup.get_option_snapshot(
+                kite_api, opt_token, effective_date, t1, hist_cache, is_live=not is_backtest
+            )
+            if snap:
+                entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
 
         if entry_ltp < MIN_ENTRY_LTP:
             return None, f"{opt_symbol}: [Contrarian Flip] Entry LTP (Rs.{entry_ltp:.2f}) < Rs.{MIN_ENTRY_LTP}. Spread too wide / dead premium."
@@ -1398,11 +1415,10 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                 try:
                     eager_base_match = _match_symbol(df_ref, sym)
                     if eager_base_match is not None:
-                        if is_backtest:
-                            eager_spot = historical_lookup.get_spot_snapshot(sym, target_date, t1) or 0
-                        else:
-                            eager_quote = kite_api.quote([f"NSE:{sym}"])
-                            eager_spot = eager_quote.get(f"NSE:{sym}", {}).get('last_price', 0)
+                        # [CHANGED -- Task 71, 22-Jul-26] Closed-candle spot
+                        # for both modes -- same reasoning as the main entry
+                        # path's spot_price above.
+                        eager_spot = historical_lookup.get_spot_snapshot(sym, effective_date, t1) or 0
                         if eager_spot:
                             # [CHANGED -- Task 65] Unified PCR method for
                             # both modes -- see get_historical_pcr's own
@@ -1468,17 +1484,24 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         current_signal_streak = None
                         continue
 
+                    # [CHANGED -- Task 71, 22-Jul-26] Spot price now sourced
+                    # from the same closed-candle CSV BACKTEST always used,
+                    # in LIVE too -- see get_spot_snapshot's docstring. LIVE
+                    # already maintains this exact file incrementally via
+                    # data_ingestion.update_incremental_data() (candle-close-
+                    # guarded, same _drop_unclosed_candles filter), so this
+                    # needed no new fetch path, just removing the live
+                    # kite_api.quote() branch that was letting a real-time
+                    # tick (which can differ from the last CLOSED candle by
+                    # enough to shift the computed ATM strike, per Harish's
+                    # 22-Jul-26 LIVE-vs-BACKTEST audit -- DIVISLAB/BAJAJ-AUTO
+                    # both resolved to no option match in BACKTEST because
+                    # the live-quote-derived strike wasn't the closed-candle
+                    # one) out of the LIVE path entirely.
                     base_match = _match_symbol(df_ref, sym)
                     spot_price = 0
                     if base_match is not None:
-                        if is_backtest:
-                            spot_price = historical_lookup.get_spot_snapshot(sym, target_date, t1) or 0
-                        else:
-                            try:
-                                quote_data = kite_api.quote([f"NSE:{sym}"])
-                                spot_price = quote_data.get(f"NSE:{sym}", {}).get('last_price', 0)
-                            except Exception:
-                                pass
+                        spot_price = historical_lookup.get_spot_snapshot(sym, effective_date, t1) or 0
 
                     opt_symbol, opt_token, lot_size, atm_strike = resolve_option_chain(
                         sym, spot_price, s1, df_ref, kite_master
@@ -1492,27 +1515,29 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     )
                     pcr_tracker.record(sym, pcr_val)
 
+                    # [CHANGED -- Task 71, 22-Jul-26] Entry LTP/volume/OI now
+                    # sourced the same way for both modes -- see
+                    # get_option_snapshot's is_live docstring
+                    # (fetch_option_live_candles already drops the still-
+                    # forming candle, same closed-candle discipline PCR/
+                    # OI-buildup already had since Task 65). Removes the
+                    # live kite_api.quote() branch that was the other half
+                    # of the LIVE-vs-BACKTEST mismatch Harish found.
                     entry_ltp, opt_vol, opt_oi = 0, 0, 0
                     if opt_symbol:
-                        if is_backtest:
-                            snap = historical_lookup.get_option_snapshot(kite_api, opt_token, target_date, t1, hist_cache)
-                            if snap:
-                                entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
-                        else:
-                            try:
-                                opt_quote = kite_api.quote([f"NFO:{opt_symbol}"])
-                                opt_data = opt_quote.get(f"NFO:{opt_symbol}", {})
-                                entry_ltp = opt_data.get('last_price', 0)
-                                opt_vol = opt_data.get('volume', 0)
-                                opt_oi = opt_data.get('oi', 0)
-                            except Exception:
-                                pass
+                        snap = historical_lookup.get_option_snapshot(
+                            kite_api, opt_token, effective_date, t1, hist_cache, is_live=not is_backtest
+                        )
+                        if snap:
+                            entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
 
                     # --- Rejection filters (see module docstring) ---
-                    if is_backtest:
-                        vix_val = historical_lookup.get_vix_snapshot(kite_api, target_date, t1, kite_master, hist_cache)
-                    else:
-                        vix_val = get_india_vix(kite_api)
+                    # [CHANGED -- Task 71, 22-Jul-26] VIX unified too -- see
+                    # get_vix_snapshot's is_live docstring. get_india_vix()
+                    # (live quote) is no longer called here.
+                    vix_val = historical_lookup.get_vix_snapshot(
+                        kite_api, effective_date, t1, kite_master, hist_cache, is_live=not is_backtest
+                    )
                     if vix_val is not None and vix_val > VIX_MAX:
                         reason = f"{opt_symbol}: India VIX ({vix_val:.2f}) > {VIX_MAX}. IV too rich for long-premium entry."
                         print(f"[REJECTED] {sym} -> {reason}")

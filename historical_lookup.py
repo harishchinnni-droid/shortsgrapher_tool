@@ -394,13 +394,52 @@ def _resolve_vix_token(kite_master, cache):
     return token
 
 
-def get_vix_snapshot(kite_api, target_date, time_str, kite_master, cache, interval='5minute'):
+def get_vix_snapshot(kite_api, target_date, time_str, kite_master, cache, interval='5minute', is_live=False):
     """India VIX AT time_str on target_date, or None if the VIX
-    instrument token can't be resolved or the history fetch fails."""
+    instrument token can't be resolved or the history fetch fails.
+
+    [CHANGED -- Task 71, 22-Jul-26] is_live=True routes through the same
+    closed-candle-only treatment as fetch_option_live_candles() (fetch
+    market-open-through-now, drop the still-forming tail candle,
+    in-memory cache only) instead of the old BACKTEST-shaped fetch
+    (fixed day_bounds to_dt=15:35, no unclosed-candle guard, disk cache).
+    Harish's explicit requirement: every pre-entry decision (spot price,
+    Entry LTP, PCR, OI-buildup, and now VIX) must be sourced from closed
+    candles only in LIVE too, exactly like BACKTEST -- only SL/TSL
+    monitoring of an already-open position should use a real-time quote.
+    Without this, a LIVE run mid-candle could ask Kite for VIX data up to
+    a future to_dt (today at 15:35) and get back the still-forming bar as
+    the last row, the same repainting risk _drop_unclosed_candles exists
+    to prevent everywhere else in this pipeline."""
     token = _resolve_vix_token(kite_master, cache)
     if token is None:
         print("[WARNING] historical_lookup: could not resolve India VIX instrument token -- VIX gate skipped.")
         return None
+
+    if is_live:
+        key = 'LIVE'
+        if key not in cache.vix_candles:
+            now = now_ist()
+            from_dt = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
+            cache.limiter.acquire()
+            try:
+                raw = kite_api.historical_data(token, from_dt, now, interval)
+                df = pd.DataFrame(raw)
+                if not df.empty:
+                    df['date'] = pd.to_datetime(df['date'])
+                    if df['date'].dt.tz is not None:
+                        df['date'] = df['date'].dt.tz_localize(None)
+                    df.set_index('date', inplace=True)
+                    df.sort_index(inplace=True)
+                    df, _dropped = data_ingestion._drop_unclosed_candles(
+                        df, interval, now, "India VIX", "LIVE VIX gate"
+                    )
+            except Exception as e:
+                print(f"[WARNING] historical_lookup: LIVE VIX fetch failed ({e}).")
+                df = pd.DataFrame()
+            cache.vix_candles[key] = df
+        row = _candle_at_or_before(cache.vix_candles[key], time_str_to_dt(target_date, time_str))
+        return float(row['close']) if row is not None else None
 
     date_str = target_date.strftime('%Y-%m-%d')
     if date_str not in cache.vix_candles:
