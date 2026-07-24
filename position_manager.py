@@ -128,18 +128,28 @@ TRAIL_LOCK_FRACTION = 0.5            # lock in 50% of the running gain above ent
 # 22-Jul-26 (target hit, trailing stop never got a chance to prove itself
 # because the position was already closed).
 #
-# Design (flag OFF by default, same as every other experimental exit-logic
-# change in this file -- A/B backtest before trusting): instead of exiting
-# at Target 1, TIGHTEN the trailing stop's lock fraction each time price
-# reaches a further checkpoint (T1 -> T2 -> T3), and -- per Harish's own
-# choice when asked -- do NOT hard-exit at T3 either. From T3 onward the
-# position is governed ENTIRELY by the (now very tight) trailing stop, so
-# a genuine trend day can run indefinitely while a fake breakout still
-# gives back only TRAIL_LOCK_STAGE3 (not all) of its gain before closing.
-# Target 1/2/3 LTP are still written to the Orders sheet as fixed
-# reference price levels regardless of whether the flag is on, so Harish
-# can see them either way.
-ENABLE_MULTI_TARGET_TRAIL = False
+# Design: instead of exiting at Target 1, TIGHTEN the trailing stop's
+# lock fraction each time price reaches a further checkpoint (T1 -> T2 ->
+# T3), and -- per Harish's own choice when asked -- do NOT hard-exit at
+# T3 either. From T3 onward the position is governed ENTIRELY by the (now
+# very tight) trailing stop, so a genuine trend day can run indefinitely
+# while a fake breakout still gives back only TRAIL_LOCK_STAGE3 (not all)
+# of its gain before closing. Target 1/2/3 LTP are always written to the
+# Orders sheet as fixed reference price levels regardless of this flag.
+#
+# [CHANGED -- Task 76, 23-Jul-26, Harish's decision] Turned ON, together
+# with ENABLE_TSL_CONFIRMATION_HOLD above, after the HEROMOTOCO 23-Jul-26
+# audit: with confirmation-hold alone the trade survived to Target 1
+# (Rs 1,140 gross) but still hard-exited there; with BOTH flags on it
+# rode the real rally through Target 3 and out at Rs 87.20 via a
+# confirmed trailing-stop breach ("past Target 3"), Rs 7,380 gross --
+# against the day's real high of ~95.70 and the chart's own high near
+# 111. Still worth an A/B backtest across a full date range before
+# treating this as final (see the TRADE-OFF note in the earlier scripted
+# test: a sharp reversal after a big run can also give back MORE than a
+# hard target would have) -- but compelling enough for Harish to enable
+# now rather than wait.
+ENABLE_MULTI_TARGET_TRAIL = True
 TARGET_1_R = REWARD_MULTIPLE          # 2R -- unchanged from today's single target
 TARGET_2_R = 3.0
 TARGET_3_R = 4.0
@@ -168,12 +178,21 @@ TRAIL_LOCK_STAGE3 = 0.90              # lock fraction once Target 3 (4R) is reac
 # not an improvement -- only a trade already sitting on unrealized profit
 # gets the extra patience.
 #
-# Off by default -- needs its own A/B backtest (same pattern as every
-# other experimental flag in this codebase) before being trusted. There's
-# evidence it would have helped THIS one trade, not proof it helps on
-# average -- more patience also means more given-back profit on trades
-# that really were reversing for good.
-ENABLE_TSL_CONFIRMATION_HOLD = False
+# [CHANGED -- Task 76, 23-Jul-26, Harish's decision] Turned ON after the
+# HEROMOTOCO 23-Jul-26 audit proved this exact scenario against real
+# candle data: entry 09:50 @ Rs 38, the 09:55 candle's high (44.7) raised
+# the trailing stop to 41.35, and that same candle's low (38.0) -- almost
+# certainly just its OPENING tick, since it closed at 42.7 near the highs
+# -- triggered an immediate exit under the old "assume low came after
+# high" same-candle rule. With this flag on, that candle's CLOSE (42.7)
+# didn't confirm a breach of 41.35, so the trade survived into the real
+# rally (10:00 close 49.05, 10:05 close 64.10, 10:10 close 87.20) instead
+# of exiting for Rs 502 fifteen minutes after entry. Still worth an A/B
+# backtest across a full range of dates before treating this as final --
+# more patience also means more given-back profit on trades that really
+# were reversing for good -- but the 23-Jul-26 evidence was compelling
+# enough for Harish to turn it on now rather than wait.
+ENABLE_TSL_CONFIRMATION_HOLD = True
 TSL_CONFIRMATION_BARS = 2            # consecutive candles/cycles closed at/below the trail before honoring it
 MAX_HOLD_MINUTES = 75                # theta-decay cap -- exit on time even absent SL/target
 EOD_SQUAREOFF_TIME = "15:15"         # hard square-off
