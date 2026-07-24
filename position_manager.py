@@ -103,6 +103,33 @@ REWARD_MULTIPLE = 2.0                # target = entry + 2R (research: 1:2 to 1:3
 TRAIL_TRIGGER_R = 1.0                # once +1R in profit, start trailing
 TRAIL_LOCK_FRACTION = 0.5            # lock in 50% of the running gain above entry
 
+# [ADDED -- Task 72, 22-Jul-26, ENABLE_MULTI_TARGET_TRAIL, Harish's request]
+# Today's single fixed target (REWARD_MULTIPLE = 2R = "Target 1" below) exits
+# the WHOLE position the instant price touches it, even on a trade that's
+# clearly still trending -- capping upside on exactly the trades that
+# deserved to run further, which was Harish's specific complaint watching
+# 22-Jul-26 (target hit, trailing stop never got a chance to prove itself
+# because the position was already closed).
+#
+# Design (flag OFF by default, same as every other experimental exit-logic
+# change in this file -- A/B backtest before trusting): instead of exiting
+# at Target 1, TIGHTEN the trailing stop's lock fraction each time price
+# reaches a further checkpoint (T1 -> T2 -> T3), and -- per Harish's own
+# choice when asked -- do NOT hard-exit at T3 either. From T3 onward the
+# position is governed ENTIRELY by the (now very tight) trailing stop, so
+# a genuine trend day can run indefinitely while a fake breakout still
+# gives back only TRAIL_LOCK_STAGE3 (not all) of its gain before closing.
+# Target 1/2/3 LTP are still written to the Orders sheet as fixed
+# reference price levels regardless of whether the flag is on, so Harish
+# can see them either way.
+ENABLE_MULTI_TARGET_TRAIL = False
+TARGET_1_R = REWARD_MULTIPLE          # 2R -- unchanged from today's single target
+TARGET_2_R = 3.0
+TARGET_3_R = 4.0
+TRAIL_LOCK_STAGE1 = 0.65              # lock fraction once Target 1 (2R) is reached
+TRAIL_LOCK_STAGE2 = 0.80              # lock fraction once Target 2 (3R) is reached
+TRAIL_LOCK_STAGE3 = 0.90              # lock fraction once Target 3 (4R) is reached -- no hard cap beyond this
+
 # [ADDED -- 17-Jul-26, Harish's request] TRAIL_LOCK_FRACTION above locks
 # in 50% of the running gain the INSTANT price touches that level -- a
 # single wick/pullback candle is enough to close a trade that's still
@@ -299,6 +326,49 @@ def compute_stop_and_target(entry_ltp, underlying_atr, atr_multiplier=ATR_MULTIP
     return stop_ltp, target_ltp, round(risk_per_unit, 2)
 
 
+def compute_multi_targets(entry_ltp, risk_per_unit_premium):
+    """[ADDED -- Task 72, 22-Jul-26] Returns (target1_ltp, target2_ltp,
+    target3_ltp) -- target1_ltp is identical to compute_stop_and_target()'s
+    target_ltp (same TARGET_1_R = REWARD_MULTIPLE), included here too so
+    all three checkpoints can be computed and written to the Orders sheet
+    together in one call. See ENABLE_MULTI_TARGET_TRAIL's docstring above."""
+    if not entry_ltp or entry_ltp <= 0 or risk_per_unit_premium <= 0:
+        return 0.0, 0.0, 0.0
+    t1 = round(entry_ltp + TARGET_1_R * risk_per_unit_premium, 2)
+    t2 = round(entry_ltp + TARGET_2_R * risk_per_unit_premium, 2)
+    t3 = round(entry_ltp + TARGET_3_R * risk_per_unit_premium, 2)
+    return t1, t2, t3
+
+
+def _target_stage_reached(gain, risk_per_unit_premium):
+    """[ADDED -- Task 72, 22-Jul-26] 0/1/2/3 -- how many of the Target
+    1/2/3 checkpoints the running gain (off max_ltp_seen, i.e. the best
+    price seen so far, not the current price) has reached. Used to decide
+    how tightly to trail -- see _trailing_lock_fraction() below."""
+    if risk_per_unit_premium <= 0:
+        return 0
+    r_multiple = gain / risk_per_unit_premium
+    if r_multiple >= TARGET_3_R:
+        return 3
+    if r_multiple >= TARGET_2_R:
+        return 2
+    if r_multiple >= TARGET_1_R:
+        return 1
+    return 0
+
+
+def _trailing_lock_fraction(stage, multi_target_enabled):
+    """[ADDED -- Task 72, 22-Jul-26] Lock fraction to apply to the running
+    gain once TRAIL_TRIGGER_R has been crossed. Stage 0 (below Target 1)
+    always uses the original TRAIL_LOCK_FRACTION regardless of the flag --
+    ENABLE_MULTI_TARGET_TRAIL only changes what happens ONCE a trade has
+    already reached Target 1 or further; it never makes the EARLY trail
+    looser or tighter than it always was."""
+    if not multi_target_enabled or stage <= 0:
+        return TRAIL_LOCK_FRACTION
+    return {1: TRAIL_LOCK_STAGE1, 2: TRAIL_LOCK_STAGE2, 3: TRAIL_LOCK_STAGE3}[stage]
+
+
 def compute_position_size(account_equity, risk_per_unit_premium, lot_size,
                            risk_pct_per_trade=RISK_PCT_PER_TRADE, max_lots=None,
                            max_loss_rs=MAX_LOSS_PER_TRADE_RS):
@@ -398,11 +468,18 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
                         'max_ltp_seen': round(max_ltp_seen, 2), 'min_ltp_seen': round(min_ltp_seen, 2)}
 
         # Ratchet the trailing stop up once price has run risk_per_unit_premium
-        # x TRAIL_TRIGGER_R in profit, locking in TRAIL_LOCK_FRACTION of the
-        # running gain above entry. Never moves the stop down.
+        # x TRAIL_TRIGGER_R in profit, locking in a fraction of the running
+        # gain above entry. Never moves the stop down.
+        # [CHANGED -- Task 72, 22-Jul-26, ENABLE_MULTI_TARGET_TRAIL] The
+        # lock fraction now TIGHTENS in stages as price clears Target 1/2/3
+        # instead of staying fixed at TRAIL_LOCK_FRACTION forever -- see
+        # _trailing_lock_fraction()'s docstring. Flag off -> byte-for-byte
+        # the original behavior (stage is computed but ignored).
         gain = max_ltp_seen - entry_ltp
+        stage = _target_stage_reached(gain, risk_per_unit_premium)
         if risk_per_unit_premium > 0 and gain >= TRAIL_TRIGGER_R * risk_per_unit_premium:
-            trailing_stop = max(trailing_stop, entry_ltp + TRAIL_LOCK_FRACTION * gain)
+            lock_fraction = _trailing_lock_fraction(stage, ENABLE_MULTI_TARGET_TRAIL)
+            trailing_stop = max(trailing_stop, entry_ltp + lock_fraction * gain)
 
         # Conservative same-candle ordering: if a single 5-min candle's
         # range spans BOTH the stop and the target, assume the stop hit
@@ -414,10 +491,14 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
         # before -- only a TRAILING breach (already in profit) can be held
         # for confirmation, and only using candle CLOSE (a wick touching
         # the level doesn't count -- see flag docstring above).
+        # [CHANGED -- Task 72] reason string notes the target stage already
+        # cleared when the flag is on, so a trailing exit past Target 1/2
+        # is distinguishable from an ordinary +1R trail in the sheet.
+        stage_note = f" (past Target {stage})" if (ENABLE_MULTI_TARGET_TRAIL and stage > 0) else ""
         is_trailing = trailing_stop > stop_ltp
         if candle_low <= trailing_stop:
             if not (ENABLE_TSL_CONFIRMATION_HOLD and is_trailing):
-                reason = 'Trailing Stop Hit' if is_trailing else 'Stop Loss Hit'
+                reason = f'Trailing Stop Hit{stage_note}' if is_trailing else 'Stop Loss Hit'
                 return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(trailing_stop, 2),
                         'exit_reason': reason, 'max_ltp_seen': round(max_ltp_seen, 2),
                         'min_ltp_seen': round(min_ltp_seen, 2)}
@@ -425,7 +506,7 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
                 tsl_breach_streak += 1
                 if tsl_breach_streak >= TSL_CONFIRMATION_BARS:
                     return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(candle_close, 2),
-                            'exit_reason': f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars)',
+                            'exit_reason': f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars){stage_note}',
                             'max_ltp_seen': round(max_ltp_seen, 2), 'min_ltp_seen': round(min_ltp_seen, 2)}
                 # Held with reason: low wicked through but didn't close
                 # beyond the trail confirmed yet -- fall through to the
@@ -434,7 +515,15 @@ def simulate_backtest_exit(kite_api, opt_token, target_date, entry_time_str, ent
                 tsl_breach_streak = 0
         else:
             tsl_breach_streak = 0
-        if candle_high >= target_ltp:
+        # [CHANGED -- Task 72, 22-Jul-26, ENABLE_MULTI_TARGET_TRAIL] With
+        # the flag ON, Target 1 (target_ltp) is no longer a hard exit --
+        # the trailing stop above (now locking a bigger fraction once
+        # Target 1/2/3 clear) is the ONLY thing that can close a winning
+        # trade, per Harish's explicit choice: keep trailing indefinitely,
+        # even past Target 3, rather than capping the position anywhere.
+        # Flag off -> byte-for-byte the original hard-exit-at-target
+        # behavior.
+        if not ENABLE_MULTI_TARGET_TRAIL and candle_high >= target_ltp:
             return {'exit_time': ts.strftime('%H:%M:%S'), 'exit_ltp': round(target_ltp, 2),
                     'exit_reason': 'Target Hit', 'max_ltp_seen': round(max_ltp_seen, 2),
                     'min_ltp_seen': round(min_ltp_seen, 2)}
@@ -501,9 +590,17 @@ def check_live_exit(entry_ltp, stop_ltp, target_ltp, risk_per_unit_premium, curr
     ENABLE_TSL_CONFIRMATION_HOLD's docstring above."""
     new_max = max(max_ltp_seen, current_ltp)
     trailing_stop = stop_ltp
+    # [CHANGED -- Task 72, 22-Jul-26, ENABLE_MULTI_TARGET_TRAIL] Same
+    # staged lock-fraction tightening as simulate_backtest_exit() -- see
+    # that function's comment and _trailing_lock_fraction()'s docstring.
+    # `stage` is re-derived fresh every poll from new_max (which is
+    # already persisted via the 'Max LTP' column), so no new column is
+    # needed just to track it across LIVE cycles.
     gain = new_max - entry_ltp
+    stage = _target_stage_reached(gain, risk_per_unit_premium)
     if risk_per_unit_premium > 0 and gain >= TRAIL_TRIGGER_R * risk_per_unit_premium:
-        trailing_stop = max(trailing_stop, entry_ltp + TRAIL_LOCK_FRACTION * gain)
+        lock_fraction = _trailing_lock_fraction(stage, ENABLE_MULTI_TARGET_TRAIL)
+        trailing_stop = max(trailing_stop, entry_ltp + lock_fraction * gain)
 
     eod_dt = now_dt.replace(
         hour=int(eod_squareoff_time.split(':')[0]), minute=int(eod_squareoff_time.split(':')[1]),
@@ -532,22 +629,25 @@ def check_live_exit(entry_ltp, stop_ltp, target_ltp, risk_per_unit_premium, curr
     # simulate_backtest_exit()'s same change] Only a TRAILING breach
     # (already in profit) can be held for confirmation across polls; the
     # original hard stop_ltp still exits instantly.
+    stage_note = f" (past Target {stage})" if (ENABLE_MULTI_TARGET_TRAIL and stage > 0) else ""
     is_trailing = trailing_stop > stop_ltp
     new_streak = tsl_breach_streak
     if current_ltp <= trailing_stop:
         if not (ENABLE_TSL_CONFIRMATION_HOLD and is_trailing):
-            reason = 'Trailing Stop Hit' if is_trailing else 'Stop Loss Hit'
+            reason = f'Trailing Stop Hit{stage_note}' if is_trailing else 'Stop Loss Hit'
             return True, reason, trailing_stop, new_max, trailing_stop, new_streak
         new_streak = tsl_breach_streak + 1
         if new_streak >= TSL_CONFIRMATION_BARS:
-            return (True, f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars)',
+            return (True, f'Trailing Stop Hit (confirmed, {TSL_CONFIRMATION_BARS} bars){stage_note}',
                     current_ltp, new_max, trailing_stop, new_streak)
         # Held with reason -- fall through to the other checks below
         # instead of exiting on this poll.
     else:
         new_streak = 0
 
-    if current_ltp >= target_ltp:
+    # [CHANGED -- Task 72] Same "no hard exit at Target 1 once the flag is
+    # on" change as simulate_backtest_exit() -- see that function's comment.
+    if not ENABLE_MULTI_TARGET_TRAIL and current_ltp >= target_ltp:
         return True, 'Target Hit', target_ltp, new_max, trailing_stop, new_streak
     if ENABLE_SIGNAL_REVERSAL_EXIT and signal_reversal_now:
         return True, '5M Reversal (Signal WAIT)', current_ltp, new_max, trailing_stop, new_streak

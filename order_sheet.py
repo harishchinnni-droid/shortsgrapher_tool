@@ -422,7 +422,17 @@ ORDER_HEADERS = [
     'Support Entry Time', 'Support Trigger Status',
     'Exit Trigger Time', 'Exit Trigger Status',
     'Spot Price', 'ATM Strike', 'Option Symbol', 'Option Token', 'Lot Size',
-    'ATR (Underlying)', 'Entry LTP', 'Stop Loss LTP', 'Target LTP', 'Risk/Unit (Rs)',
+    'ATR (Underlying)', 'Entry LTP', 'Stop Loss LTP',
+    'Target LTP',
+    # [ADDED -- Task 72, 22-Jul-26, ENABLE_MULTI_TARGET_TRAIL] 2nd/3rd
+    # take-profit checkpoints -- see position_manager.py's own docstring.
+    # 'Target LTP' above is Target 1 (unchanged column, so nothing that
+    # already reads it breaks). Always populated (even when the flag is
+    # off) so switching it on later doesn't require a schema change --
+    # only the flag controls whether they're ever actually used to keep
+    # a winning trade open past 'Target LTP' instead of exiting there.
+    'Target 2 LTP', 'Target 3 LTP',
+    'Risk/Unit (Rs)',
     'Quantity (Lots)', 'Quantity (Units)', 'Risk Amount (Rs)',
     'Current LTP', 'Max LTP', 'Min LTP',
     # [ADDED -- ENABLE_TSL_CONFIRMATION_HOLD] Persists position_manager.
@@ -1182,7 +1192,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         f"{age_label} bars ago, needs <= {SMC_MAX_ZONE_AGE}). "
                         f"No recent, direction-agreeing order-block retest.")
 
-    def _try_contrarian_flip(sym, original_signal, t1, spot_price):
+    def _try_contrarian_flip(sym, original_signal, t1, t3, entry_spot_price):
         """[ADDED -- ENABLE_PCR_CONTRARIAN_FLIP, Harish's idea, 16-Jul-26]
         Called only when the ORIGINAL momentum-confluence signal
         (original_signal) was about to be rejected by the PCR trap gate
@@ -1206,15 +1216,18 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         flipped_signal = "BUY PE" if original_signal == "BUY CE" else "BUY CE"
 
         opt_symbol, opt_token, lot_size, atm_strike = resolve_option_chain(
-            sym, spot_price, flipped_signal, df_ref, kite_master
+            sym, entry_spot_price, flipped_signal, df_ref, kite_master
         )
 
         # [CHANGED -- Task 71, 22-Jul-26] Same closed-candle unification as
         # the main entry path -- see get_option_snapshot's is_live docstring.
+        # [CHANGED -- Task 72, 22-Jul-26] Priced as of t3, same reasoning as
+        # the main entry path's entry_ltp -- see note above resolve_option_
+        # chain() there.
         entry_ltp, opt_vol, opt_oi = 0, 0, 0
         if opt_symbol:
             snap = historical_lookup.get_option_snapshot(
-                kite_api, opt_token, effective_date, t1, hist_cache, is_live=not is_backtest
+                kite_api, opt_token, effective_date, t3, hist_cache, is_live=not is_backtest
             )
             if snap:
                 entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
@@ -1262,6 +1275,9 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         except (TypeError, ValueError):
             underlying_atr = 0.0
         stop_ltp, target_ltp, risk_per_unit = position_manager.compute_stop_and_target(entry_ltp, underlying_atr)
+        # [ADDED -- Task 72, 22-Jul-26] Target 2/3 -- see the main entry
+        # path's identical comment above.
+        _, target2_ltp, target3_ltp = position_manager.compute_multi_targets(entry_ltp, risk_per_unit)
         num_lots, quantity, risk_amount = position_manager.compute_position_size(
             account_equity, risk_per_unit, lot_size
         )
@@ -1281,6 +1297,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             'Lot Size': lot_size,
             'ATR (Underlying)': round(underlying_atr, 2),
             'Entry LTP': entry_ltp, 'Stop Loss LTP': stop_ltp, 'Target LTP': target_ltp,
+            'Target 2 LTP': target2_ltp, 'Target 3 LTP': target3_ltp,
             'Risk/Unit (Rs)': risk_per_unit,
             'Quantity (Lots)': num_lots, 'Quantity (Units)': quantity, 'Risk Amount (Rs)': risk_amount,
             'Current LTP': entry_ltp, 'Max LTP': entry_ltp, 'Min LTP': entry_ltp,
@@ -1498,13 +1515,27 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     # both resolved to no option match in BACKTEST because
                     # the live-quote-derived strike wasn't the closed-candle
                     # one) out of the LIVE path entirely.
+                    # [CHANGED -- Task 72, 22-Jul-26] `spot_price` (t1) feeds
+                    # ONLY the PCR gate below, unchanged -- Harish's call:
+                    # gate CONDITIONS (PCR/OI-buildup/VIX/ADX/ZeroLag) stay
+                    # judged as of t1, the first bar of the 3-bar streak.
+                    # `entry_spot_price` (t3, the bar the streak actually
+                    # CONFIRMS on -- the earliest point you'd genuinely know
+                    # to act) is the new, SEPARATE price used to pick which
+                    # contract to actually buy and what you'd pay for it --
+                    # see resolve_option_chain/entry_ltp below. Was a single
+                    # shared t1-based `spot_price` for everything: an order
+                    # was priced/struck 10 minutes stale relative to the
+                    # moment the streak was actually confirmed.
                     base_match = _match_symbol(df_ref, sym)
                     spot_price = 0
+                    entry_spot_price = 0
                     if base_match is not None:
                         spot_price = historical_lookup.get_spot_snapshot(sym, effective_date, t1) or 0
+                        entry_spot_price = historical_lookup.get_spot_snapshot(sym, effective_date, t3) or spot_price
 
                     opt_symbol, opt_token, lot_size, atm_strike = resolve_option_chain(
-                        sym, spot_price, s1, df_ref, kite_master
+                        sym, entry_spot_price, s1, df_ref, kite_master
                     )
 
                     # [CHANGED -- Task 65] Unified PCR method for both
@@ -1523,10 +1554,15 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     # OI-buildup already had since Task 65). Removes the
                     # live kite_api.quote() branch that was the other half
                     # of the LIVE-vs-BACKTEST mismatch Harish found.
+                    # [CHANGED -- Task 72, 22-Jul-26] Priced as of t3 (the
+                    # confirming bar), not t1 -- see entry_spot_price note
+                    # above. Harish's own words: "Entry LTP should be when
+                    # we are placing an order (i.e. after 3 subsequent
+                    # value)."
                     entry_ltp, opt_vol, opt_oi = 0, 0, 0
                     if opt_symbol:
                         snap = historical_lookup.get_option_snapshot(
-                            kite_api, opt_token, effective_date, t1, hist_cache, is_live=not is_backtest
+                            kite_api, opt_token, effective_date, t3, hist_cache, is_live=not is_backtest
                         )
                         if snap:
                             entry_ltp, opt_vol, opt_oi = snap['close'], snap['volume'], snap['oi']
@@ -1554,7 +1590,10 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         # before ever being trusted.
                         flip_fields, flip_result = (None, None)
                         if ENABLE_PCR_CONTRARIAN_FLIP:
-                            flip_fields, flip_result = _try_contrarian_flip(sym, s1, t1, spot_price)
+                            # [CHANGED -- Task 72] entry_spot_price (t3), not
+                            # the PCR gate's t1-based spot_price -- see note
+                            # above resolve_option_chain().
+                            flip_fields, flip_result = _try_contrarian_flip(sym, s1, t1, t3, entry_spot_price)
 
                         if flip_fields is None:
                             reason = f"{opt_symbol}: {pcr_reason}"
@@ -1585,7 +1624,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                             'Pre-Entry Trigger Time': t1, 'Pre-Entry Trigger Status': s1,
                             'Entry Trigger Time': t2, 'Entry Trigger Status': s2,
                             'Support Entry Time': t3, 'Support Trigger Status': s3,
-                            'Spot Price': spot_price,
+                            'Spot Price': entry_spot_price,  # [CHANGED -- Task 72] as-of t3
                             'Gross P/L (Rs)': "", 'Costs (Rs)': "", 'Net P/L (Rs)': "",
                             'Exit Time': "",
                         })
@@ -1727,6 +1766,11 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                     except (TypeError, ValueError):
                         underlying_atr = 0.0
                     stop_ltp, target_ltp, risk_per_unit = position_manager.compute_stop_and_target(entry_ltp, underlying_atr)
+                    # [ADDED -- Task 72, 22-Jul-26] Target 2/3 checkpoints --
+                    # see ENABLE_MULTI_TARGET_TRAIL's docstring in
+                    # position_manager.py. Written to the sheet regardless
+                    # of whether the flag is on.
+                    _, target2_ltp, target3_ltp = position_manager.compute_multi_targets(entry_ltp, risk_per_unit)
                     num_lots, quantity, risk_amount = position_manager.compute_position_size(
                         account_equity, risk_per_unit, lot_size
                     )
@@ -1753,13 +1797,14 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         'Pre-Entry Trigger Time': t1, 'Pre-Entry Trigger Status': s1,
                         'Entry Trigger Time': t2, 'Entry Trigger Status': s2,
                         'Support Entry Time': t3, 'Support Trigger Status': s3,
-                        'Spot Price': spot_price,
+                        'Spot Price': entry_spot_price,  # [CHANGED -- Task 72] as-of t3, matches Entry LTP's timing
                         'ATM Strike': atm_strike if opt_symbol else "N/A",
                         'Option Symbol': opt_symbol or "NOT_FOUND",
                         'Option Token': opt_token or "",
                         'Lot Size': lot_size,
                         'ATR (Underlying)': round(underlying_atr, 2),
                         'Entry LTP': entry_ltp, 'Stop Loss LTP': stop_ltp, 'Target LTP': target_ltp,
+                        'Target 2 LTP': target2_ltp, 'Target 3 LTP': target3_ltp,
                         'Risk/Unit (Rs)': risk_per_unit,
                         'Quantity (Lots)': num_lots, 'Quantity (Units)': quantity, 'Risk Amount (Rs)': risk_amount,
                         'Current LTP': entry_ltp, 'Max LTP': entry_ltp, 'Min LTP': entry_ltp,

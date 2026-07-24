@@ -84,9 +84,20 @@ def _build_reference_from_google_sheet(new_filename):
     df.to_excel(new_filename, sheet_name='Reference', index=False)
 
 
-def provision_daily_trade_file(target_date):
+def provision_daily_trade_file(target_date, mode=None):
+    """[CHANGED -- Task 72, 22-Jul-26] mode ('LIVE'/'BACKTEST', i.e.
+    calendar_mgmt.LIVE/calendar_mgmt.BACKTEST -- compared as plain
+    strings here to avoid importing calendar_mgmt into this module)
+    appends '-L' or '-BT' to the filename, per Harish's request so a
+    LIVE run and a BACKTEST run for the SAME calendar date no longer
+    collide/overwrite each other and can be compared side-by-side
+    without either one having to be manually renamed first (exactly the
+    manual step Harish was doing by hand before every LIVE-vs-BACKTEST
+    audit so far). mode=None (default) keeps the old unsuffixed name for
+    any caller that hasn't been updated to pass it."""
     date_str = target_date.strftime('%d-%b-%y')
-    new_filename = os.path.join(BASE_DIR, f"{date_str} FNO.xlsx")
+    suffix = {"LIVE": "-L", "BACKTEST": "-BT"}.get(mode, "")
+    new_filename = os.path.join(BASE_DIR, f"{date_str} FNO{suffix}.xlsx")
 
     if not os.path.exists(new_filename):
         if os.path.exists(SOURCE_FILE):

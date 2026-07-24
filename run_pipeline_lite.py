@@ -65,7 +65,10 @@ def run_pipeline_for_date_lite(smart_api, kite_api, target_date, mode):
     """Steps 3-8 only, mirrors run_pipeline.run_pipeline_for_date() exactly
     except for the INDICATORS list. Returns (final_excel_path, df_ref)."""
     # STEP 3: File Provisioning
-    new_filename = file_mgmt.provision_daily_trade_file(target_date)
+    # [CHANGED -- Task 72, 22-Jul-26] mode threaded through so LIVE/
+    # BACKTEST get separate "-L"/"-BT" filenames -- see that function's
+    # docstring.
+    new_filename = file_mgmt.provision_daily_trade_file(target_date, mode=mode)
     # STEP 4: Token Synchronization & Mapping
     df_ref = token_mgmt.update_instrument_tokens(new_filename, kite_api, target_date=target_date)
     # STEP 5: Historical Data Ingestion
