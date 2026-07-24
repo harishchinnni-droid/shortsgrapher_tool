@@ -40,18 +40,30 @@ import calendar_mgmt
 import run_pipeline_lite
 import lite_final_sheet
 import order_sheet
+import process_log
 from ist_clock import now_ist, is_before_market_open, seconds_until_market_open, MARKET_CLOSE_TIME
 
 CYCLE_INTERVAL_SECONDS = 300  # 5 minutes -- matches every indicator's own 5-minute candle interval
 
 
-def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_day=False):
+def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_day=False, cycle_num=0):
     """One full pass of the lite pipeline for one date: data -> 3
     indicators -> unanimous confluence -> orders/positions (order_sheet.py,
     unmodified) -> same TSL/SL/PCR/audit logic as the full pipeline."""
+    # [ADDED -- Task 73, 22-Jul-26] Process Log timer -- covers file
+    # provisioning + token sync + historical data ingestion + indicator
+    # computation + Final sheet write ONLY. Deliberately stops before
+    # order_sheet.py is even called -- see process_log.py's own docstring
+    # for why (Harish's explicit boundary: "not placing orders from order
+    # sheet and TSL").
+    _cycle_start = time.time()
     final_excel_path, df_ref = run_pipeline_lite.run_pipeline_for_date_lite(smart_api, kite_api, target_date, mode)
 
     lite_final_sheet.run_final_sheet_lite_step(final_excel_path)
+    _cycle_duration = time.time() - _cycle_start
+    process_log.log_cycle_timing(
+        final_excel_path, mode, target_date, cycle_num, _cycle_duration, now_ist().strftime('%H:%M:%S')
+    )
 
     if mode == calendar_mgmt.LIVE and not live_first_run_of_day:
         order_sheet.update_open_positions_live(kite_api, final_excel_path)
@@ -109,7 +121,8 @@ def run_live_session(smart_api, kite_api, target_date):
         print(f"  LIVE CYCLE {cycle_num} -- {now.strftime('%H:%M:%S')} IST")
         print("=" * 60)
         try:
-            _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE, live_first_run_of_day=(cycle_num == 1))
+            _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE,
+                             live_first_run_of_day=(cycle_num == 1), cycle_num=cycle_num)
         except Exception as e:
             print(f"[ERROR] LIVE cycle {cycle_num} failed: {e}")
             print(traceback.format_exc())

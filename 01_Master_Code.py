@@ -53,12 +53,13 @@ import calendar_mgmt
 import run_pipeline
 import final_sheet
 import order_sheet
+import process_log
 from ist_clock import now_ist, is_before_market_open, seconds_until_market_open, MARKET_CLOSE_TIME
 
 CYCLE_INTERVAL_SECONDS = 300  # 5 minutes -- matches every indicator's own 5-minute candle interval
 
 
-def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_day=False):
+def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_day=False, cycle_num=0):
     """One full pass of the pipeline for one date: data -> indicators ->
     confluence -> orders/positions -> dashboard. Used identically by both
     the BACKTEST date loop and each LIVE 5-minute cycle -- the only
@@ -67,9 +68,18 @@ def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_da
     that function already decides for itself based on `mode` and what's
     already on disk.
     """
+    # [ADDED -- Task 73, 22-Jul-26] Process Log timer -- see
+    # process_log.py's own docstring / 02_Master_Code_3Indicator.py's
+    # identical comment for the exact boundary (data + indicators + Final
+    # sheet only, stops before order_sheet.py is ever called).
+    _cycle_start = time.time()
     final_excel_path, df_ref = run_pipeline.run_pipeline_for_date(smart_api, kite_api, target_date, mode)
 
     final_sheet.run_final_sheet_step(final_excel_path)
+    _cycle_duration = time.time() - _cycle_start
+    process_log.log_cycle_timing(
+        final_excel_path, mode, target_date, cycle_num, _cycle_duration, now_ist().strftime('%H:%M:%S')
+    )
 
     if mode == calendar_mgmt.LIVE and not live_first_run_of_day:
         # [IMPORTANT] Must run BEFORE run_order_sheet_step() -- see
@@ -143,7 +153,8 @@ def run_live_session(smart_api, kite_api, target_date):
         print(f"  LIVE CYCLE {cycle_num} -- {now.strftime('%H:%M:%S')} IST")
         print("=" * 60)
         try:
-            _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE, live_first_run_of_day=(cycle_num == 1))
+            _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE,
+                             live_first_run_of_day=(cycle_num == 1), cycle_num=cycle_num)
         except Exception as e:
             # [IMPORTANT] A single cycle failing (a rate-limit blip, a
             # transient network error, one bad symbol) must not kill the
