@@ -1361,7 +1361,22 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
         stop_ltp = float(order.get('Stop Loss LTP') or 0)
         target_ltp = float(order.get('Target LTP') or 0)
         risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
-        entry_time_str = order.get('Pre-Entry Trigger Time')
+        # [FIXED -- Task 74, 23-Jul-26, HEROMOTOCO audit] Was 'Pre-Entry
+        # Trigger Time' (t1) -- WRONG since Task 72 repriced Entry LTP to
+        # t3 ('Support Entry Time') without updating this anchor to match.
+        # simulate_backtest_exit() walks forward through candles strictly
+        # AFTER this timestamp -- anchoring it to t1 (10 minutes before
+        # the real, t3-priced entry) let candles that happened BEFORE the
+        # trade was actually entered get scanned as if they came after
+        # it, comparing entry_ltp (a t3 price, e.g. Rs 38 after the dip
+        # had already recovered) against a stop-loss check on the t1->t2
+        # candles' own low (e.g. Rs 25.6, from BEFORE entry) -- a
+        # completely fabricated "Hard Stop-Loss" hit on a trade that, in
+        # the real 09:50 entry, never saw that low at all. Confirmed
+        # directly against HEROMOTOCO 23-Jul-26: entered 09:50 at Rs 38,
+        # underlying option kept climbing to 111 by 12:00, yet the sheet
+        # showed 'Hard Stop-Loss' at 09:45 -- BEFORE the entry bar itself.
+        entry_time_str = order.get('Support Entry Time')
         quantity = _safe_int(order.get('Quantity (Units)'))  # [FIXED -- Task 67] NaN-safe
 
         result = position_manager.simulate_backtest_exit(
@@ -1898,7 +1913,9 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             stop_ltp = float(order.get('Stop Loss LTP') or 0)
             target_ltp = float(order.get('Target LTP') or 0)
             risk_per_unit = float(order.get('Risk/Unit (Rs)') or 0)
-            entry_time_str = order.get('Pre-Entry Trigger Time')
+            # [FIXED -- Task 74] Same t1->t3 fix as _resolve_backtest_exit_now()
+            # above -- see that function's comment for the full bug.
+            entry_time_str = order.get('Support Entry Time')
             reversal_time_str = order.get('Exit Trigger Time') or None
             quantity = _safe_int(order.get('Quantity (Units)'))  # [MOVED / FIXED -- Task 67] NaN-safe
 
@@ -1942,9 +1959,15 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
     # this whole pass fixes and is left as a known limitation rather than
     # chased to a full fixed point.
     if is_backtest:
+        # [FIXED -- Task 74, 23-Jul-26] Was sorted/replayed by 'Pre-Entry
+        # Trigger Time' (t1) -- the REAL entry (and its Entry LTP) is now
+        # priced at t3 ('Support Entry Time', since Task 72), so true
+        # wall-clock order across every symbol has to sort by t3 too, or
+        # this chronological replay can process/breach-check trades out
+        # of their actual real-time order.
         entered_orders = [(key, o) for key, o in existing_orders.items()
                            if str(o.get('Net P/L (Rs)', "")).strip() not in ("", "nan")]
-        entered_orders.sort(key=lambda pair: str(pair[1].get('Pre-Entry Trigger Time', "")))
+        entered_orders.sort(key=lambda pair: str(pair[1].get('Support Entry Time', "")))
         replay_guard = position_manager.DailyDrawdownGuard(max_daily_loss_rs=position_manager.DAILY_MAX_LOSS_RS)
         pruned_keys = []
         pl_pruned = 0.0
@@ -1960,7 +1983,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                 pl_pruned += float(o.get('Net P/L (Rs)') or 0)
                 continue
             net_pl = float(o.get('Net P/L (Rs)') or 0)
-            replay_guard.update(net_pl, at_time_str=o.get('Pre-Entry Trigger Time'))
+            replay_guard.update(net_pl, at_time_str=o.get('Support Entry Time'))  # [FIXED -- Task 74] t3, real entry time
         for key in pruned_keys:
             del existing_orders[key]
         if pruned_keys:
@@ -2149,10 +2172,16 @@ def update_open_positions_live(kite_api, output_excel_path):
         min_ltp_seen = float(order.get('Min LTP') or entry_ltp)
         tsl_breach_streak = _safe_int(order.get('TSL Breach Streak'))  # [FIXED -- Task 67] see position_manager.check_live_exit()
         quantity = _safe_int(order.get('Quantity (Units)'))  # [MOVED] up so it can be passed in below
-        pre_entry_time = order.get('Pre-Entry Trigger Time')
+        # [FIXED -- Task 74, 23-Jul-26] Was 'Pre-Entry Trigger Time' (t1) --
+        # same t1-vs-t3 mismatch as _resolve_backtest_exit_now(), just
+        # lower-stakes here since LIVE only uses entry_dt for ELAPSED-TIME
+        # checks (Max Hold Time, No Follow-Through), not a candle replay --
+        # but it was still overstating how long the position had been
+        # open by the t1->t3 gap (10 min), firing those timers early.
+        support_entry_time = order.get('Support Entry Time')
         try:
             entry_dt = now.replace(
-                hour=int(str(pre_entry_time).split(':')[0]), minute=int(str(pre_entry_time).split(':')[1]),
+                hour=int(str(support_entry_time).split(':')[0]), minute=int(str(support_entry_time).split(':')[1]),
                 second=0, microsecond=0,
             )
         except Exception:
