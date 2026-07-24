@@ -72,6 +72,23 @@ IST = pytz.timezone('Asia/Kolkata')
 ACCOUNT_EQUITY_DEFAULT = 500_000.0   # override via run_order_sheet_step(account_equity=...)
 RISK_PCT_PER_TRADE = 0.01            # 1% of equity risked per trade
 
+# [ADDED -- Task 75, 23-Jul-26, Harish's request] The equity-risk formula
+# below (risk_amount / (risk_per_unit x lot_size)) can size a position at
+# more than 1 lot whenever a trade's ATR-based stop distance is tight
+# relative to the Rs 2,000 risk budget -- e.g. HEROMOTOCO 23-Jul-26 sized
+# to 3 lots (risk/unit Rs 3.8 x lot size 150 = Rs 570/lot, comfortably
+# under Rs 2,000 three times over). Harish wants every trade capped at 1
+# lot regardless of what the risk formula alone would allow -- simpler
+# position management while this is still being tested/paper-traded.
+# compute_position_size() already had a max_lots parameter (previously
+# unused, defaulting to None/unlimited); this constant is now its
+# default, so every caller gets the cap automatically without needing to
+# pass it explicitly. Does NOT weaken the risk-based rejection itself --
+# a trade whose risk/unit is so wide that even 1 lot would blow past the
+# Rs 2,000 budget is still rejected (num_lots floors to 0 before this cap
+# is ever applied), this only ever prevents sizing UP past 1 lot.
+MAX_LOTS_PER_TRADE = 1
+
 # [CHANGED] Rs 5,000 -> Rs 2,000 per user request. At the Rs 5,00,000
 # default equity, RISK_PCT_PER_TRADE alone sized positions for a Rs 5,000
 # loss at full stop -- confirmed too high by the 5-day retest (06-10 Jul,
@@ -370,7 +387,7 @@ def _trailing_lock_fraction(stage, multi_target_enabled):
 
 
 def compute_position_size(account_equity, risk_per_unit_premium, lot_size,
-                           risk_pct_per_trade=RISK_PCT_PER_TRADE, max_lots=None,
+                           risk_pct_per_trade=RISK_PCT_PER_TRADE, max_lots=MAX_LOTS_PER_TRADE,
                            max_loss_rs=MAX_LOSS_PER_TRADE_RS):
     """Risk-based sizing: quantity = floor(risk_amount / (risk_per_unit x
     lot_size)). Returns (num_lots, quantity, risk_amount_rupees).
@@ -379,7 +396,13 @@ def compute_position_size(account_equity, risk_per_unit_premium, lot_size,
     round up to 1 (that would blow past the stated risk_pct_per_trade).
 
     [CHANGED] risk_amount is now the equity-based figure CAPPED at
-    max_loss_rs -- see MAX_LOSS_PER_TRADE_RS docstring above for why."""
+    max_loss_rs -- see MAX_LOSS_PER_TRADE_RS docstring above for why.
+
+    [CHANGED -- Task 75, 23-Jul-26] max_lots now defaults to
+    MAX_LOTS_PER_TRADE (1) instead of None/unlimited -- see that
+    constant's docstring. Pass max_lots=None explicitly to restore
+    unlimited equity-risk-based sizing if this default is ever loosened
+    again."""
     risk_amount = min(account_equity * risk_pct_per_trade, max_loss_rs)
     if risk_per_unit_premium <= 0 or lot_size <= 0:
         return 0, 0, round(risk_amount, 2)

@@ -434,6 +434,14 @@ ORDER_HEADERS = [
     'Target 2 LTP', 'Target 3 LTP',
     'Risk/Unit (Rs)',
     'Quantity (Lots)', 'Quantity (Units)', 'Risk Amount (Rs)',
+    # [ADDED -- Task 75, 23-Jul-26, Harish's request] Entry LTP x Lot Size
+    # for exactly ONE lot -- the actual premium/capital outlay to buy 1
+    # lot of this specific contract, regardless of how many lots this
+    # simulation actually sized (now capped at 1 anyway -- see
+    # position_manager.MAX_LOTS_PER_TRADE). For capital-planning once
+    # testing is done: scan this column across every symbol to see how
+    # much cash each one's typical setup would actually require.
+    'Capital Required (1 Lot)',
     'Current LTP', 'Max LTP', 'Min LTP',
     # [ADDED -- ENABLE_TSL_CONFIRMATION_HOLD] Persists position_manager.
     # check_live_exit()'s confirmation counter across LIVE polling cycles
@@ -1300,6 +1308,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
             'Target 2 LTP': target2_ltp, 'Target 3 LTP': target3_ltp,
             'Risk/Unit (Rs)': risk_per_unit,
             'Quantity (Lots)': num_lots, 'Quantity (Units)': quantity, 'Risk Amount (Rs)': risk_amount,
+            'Capital Required (1 Lot)': round(entry_ltp * lot_size, 2),  # [ADDED -- Task 75]
             'Current LTP': entry_ltp, 'Max LTP': entry_ltp, 'Min LTP': entry_ltp,
             'Order ID': order_id,
         }
@@ -1822,6 +1831,7 @@ def build_order_sheet(output_excel_path, kite_api, df_ref, mode=calendar_mgmt.LI
                         'Target 2 LTP': target2_ltp, 'Target 3 LTP': target3_ltp,
                         'Risk/Unit (Rs)': risk_per_unit,
                         'Quantity (Lots)': num_lots, 'Quantity (Units)': quantity, 'Risk Amount (Rs)': risk_amount,
+                        'Capital Required (1 Lot)': round(entry_ltp * lot_size, 2),  # [ADDED -- Task 75]
                         'Current LTP': entry_ltp, 'Max LTP': entry_ltp, 'Min LTP': entry_ltp,
                         'Gross P/L (Rs)': "", 'Costs (Rs)': "", 'Net P/L (Rs)': "",
                         'Order ID': order_id, 'Exit Time': "",
