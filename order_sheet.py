@@ -2096,6 +2096,59 @@ def run_order_sheet_step(output_excel_path, kite_api, df_ref,
 
 
 # ---------------------------------------------------------------------------
+# [ADDED -- Task 77, 24-Jul-26, Harish's request] Fast pre-check for the
+# 30-second SL/TSL poll loop (see 01_Master_Code.py / 02_Master_Code_
+# 3Indicator.py's run_live_session()). The whole point of polling every
+# 30s instead of every 5min is to react faster to a reversal on an
+# ALREADY-OPEN position -- if nothing is open there's nothing to react
+# to, so this lets the fast loop skip update_open_positions_live() (and
+# therefore every kite_api.quote() call inside it) entirely, cheaply,
+# rather than doing a full pandas read + DailyDrawdownGuard setup 750+
+# times over a trading day for no reason. Uses openpyxl directly in
+# read_only mode (just peeking at one column) instead of pd.read_excel()
+# for that same reason -- this needs to be as close to free as possible
+# since it runs twice a minute all day regardless of whether anything's
+# open.
+# ---------------------------------------------------------------------------
+def has_open_positions(output_excel_path):
+    """True if output_excel_path has an 'Orders' sheet with at least one
+    row whose 'Exit Time' is still blank (a position genuinely open right
+    now). False if the file/sheet doesn't exist yet, or every row is
+    already closed. Defaults to True (i.e. 'go ahead and do the real
+    check') on any read error -- a false positive here just costs one
+    harmless extra update_open_positions_live() call; a false negative
+    would silently stop protecting a real open position, which is the
+    one outcome this function must never risk."""
+    if not output_excel_path or not os.path.exists(output_excel_path):
+        return False
+    wb = None
+    try:
+        wb = load_workbook(output_excel_path, read_only=True, data_only=True)
+        if 'Orders' not in wb.sheetnames:
+            return False
+        ws = wb['Orders']
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header is None or 'Exit Time' not in header:
+            return False
+        exit_col_idx = header.index('Exit Time')
+        for row in rows:
+            val = row[exit_col_idx] if exit_col_idx < len(row) else None
+            if val is None or str(val).strip() == "":
+                return True
+        return False
+    except Exception as e:
+        print(f"[WARNING] has_open_positions: check failed ({e}) -- defaulting to True (safe fallback).")
+        return True
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # [ADDED] LIVE-mode open-position polling -- call once per candle-close
 # cycle (see 01_Master_Code.py's run_cycle() patch notes). Reads every
 # still-open row in 'Orders', checks it against position_manager's

@@ -37,6 +37,7 @@ import traceback
 
 import broker_auth
 import calendar_mgmt
+import file_mgmt
 import run_pipeline_lite
 import lite_final_sheet
 import order_sheet
@@ -44,6 +45,10 @@ import process_log
 from ist_clock import now_ist, is_before_market_open, seconds_until_market_open, MARKET_CLOSE_TIME
 
 CYCLE_INTERVAL_SECONDS = 300  # 5 minutes -- matches every indicator's own 5-minute candle interval
+# [ADDED -- Task 77, 24-Jul-26, Harish's request] SL/TSL-only poll cadence
+# -- see run_live_session()'s docstring. Independent of CYCLE_INTERVAL_
+# SECONDS above (which still governs the full data/indicator/entry cycle).
+TSL_POLL_INTERVAL_SECONDS = 30
 
 
 def _run_full_cycle(smart_api, kite_api, target_date, mode, live_first_run_of_day=False, cycle_num=0):
@@ -102,7 +107,21 @@ def run_backtest_range(smart_api, kite_api, trading_dates):
 
 def run_live_session(smart_api, kite_api, target_date):
     """Runs today once immediately, then loops every CYCLE_INTERVAL_SECONDS
-    until NSE market close."""
+    until NSE market close.
+
+    [CHANGED -- Task 77, 24-Jul-26, Harish's request] The loop itself now
+    ticks every TSL_POLL_INTERVAL_SECONDS (30s), not CYCLE_INTERVAL_SECONDS
+    (5min). Only the tick that lands at/after the next real 5-minute
+    candle close runs the FULL cycle below (data ingestion, indicators,
+    entry decisions -- unchanged, still closed-candle-only, per Harish's
+    standing requirement -- "everything work on closed candle only ...
+    till order is placed"). Every OTHER tick is a much lighter SL/TSL-only
+    poll: if there's at least one open position, order_sheet.
+    update_open_positions_live() runs (one live quote() per open
+    position) so a stop-loss/trailing-stop can react within ~30 seconds
+    instead of waiting up to 5 minutes; if nothing is open, order_sheet.
+    has_open_positions() lets it skip entirely -- "if there is no active
+    trade then no action, skip the step", exactly as asked."""
     if is_before_market_open():
         wait_s = seconds_until_market_open()
         print(f"[SYSTEM] Market not open yet -- waiting {wait_s / 60:.1f} minute(s) for 09:15 IST...")
@@ -110,28 +129,44 @@ def run_live_session(smart_api, kite_api, target_date):
 
     print(f"\n[SYSTEM] LIVE session (3-indicator lite) starting for {target_date.strftime('%d-%b-%y')}.")
     cycle_num = 0
+    next_full_cycle_at = time.monotonic()  # run the first full cycle immediately
     while True:
         now = now_ist()
         if now.time() >= MARKET_CLOSE_TIME:
             print("[SYSTEM] Market closed (15:30 IST). Ending LIVE session for today.")
             break
 
-        cycle_num += 1
-        print("\n" + "=" * 60)
-        print(f"  LIVE CYCLE {cycle_num} -- {now.strftime('%H:%M:%S')} IST")
-        print("=" * 60)
-        try:
-            _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE,
-                             live_first_run_of_day=(cycle_num == 1), cycle_num=cycle_num)
-        except Exception as e:
-            print(f"[ERROR] LIVE cycle {cycle_num} failed: {e}")
-            print(traceback.format_exc())
+        tick_start = time.monotonic()
 
-        now = now_ist()
-        seconds_into_interval = (now.minute % 5) * 60 + now.second
-        sleep_s = max(5.0, CYCLE_INTERVAL_SECONDS - seconds_into_interval)
-        print(f"[SYSTEM] Sleeping {sleep_s:.0f}s until next cycle...")
-        time.sleep(sleep_s)
+        if tick_start >= next_full_cycle_at:
+            cycle_num += 1
+            print("\n" + "=" * 60)
+            print(f"  LIVE CYCLE {cycle_num} -- {now.strftime('%H:%M:%S')} IST")
+            print("=" * 60)
+            try:
+                _run_full_cycle(smart_api, kite_api, target_date, calendar_mgmt.LIVE,
+                                 live_first_run_of_day=(cycle_num == 1), cycle_num=cycle_num)
+            except Exception as e:
+                print(f"[ERROR] LIVE cycle {cycle_num} failed: {e}")
+                print(traceback.format_exc())
+
+            now2 = now_ist()
+            seconds_into_interval = (now2.minute % 5) * 60 + now2.second
+            sleep_until_next_cycle = max(5.0, CYCLE_INTERVAL_SECONDS - seconds_into_interval)
+            next_full_cycle_at = time.monotonic() + sleep_until_next_cycle
+            print(f"[SYSTEM] Next full cycle in ~{sleep_until_next_cycle:.0f}s -- fast SL/TSL "
+                  f"poll (every {TSL_POLL_INTERVAL_SECONDS}s) continues in between.")
+        else:
+            # [ADDED -- Task 77] Fast SL/TSL-only poll.
+            try:
+                final_excel_path = file_mgmt.provision_daily_trade_file(target_date, mode=calendar_mgmt.LIVE)
+                if order_sheet.has_open_positions(final_excel_path):
+                    order_sheet.update_open_positions_live(kite_api, final_excel_path)
+            except Exception as e:
+                print(f"[WARNING] Fast TSL poll at {now.strftime('%H:%M:%S')} failed (non-fatal): {e}")
+
+        elapsed = time.monotonic() - tick_start
+        time.sleep(max(1.0, TSL_POLL_INTERVAL_SECONDS - elapsed))
 
 
 def main():
